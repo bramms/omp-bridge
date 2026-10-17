@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">omp-bridge: a bridge from Oh My Pi to free OpenCode models</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1640"/>
+      <stop offset="0.62" stop-color="#2a1f5c"/>
+      <stop offset="1" stop-color="#0d2f3f"/>
+    </linearGradient>
+    <linearGradient id="steel" gradientUnits="userSpaceOnUse" x1="18" y1="0" x2="238" y2="0">
+      <stop offset="0" stop-color="#ff7ab6"/>
+      <stop offset="0.5" stop-color="#ffb36b"/>
+      <stop offset="1" stop-color="#5ee6c8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffe9a8" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffe9a8" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="tile"><rect width="256" height="256" rx="56"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect width="256" height="256" fill="url(#sky)"/>
+
+    <!-- stars -->
+    <g fill="#fff">
+      <circle cx="38" cy="40" r="1.6" opacity=".7"/>
+      <circle cx="74" cy="24" r="1.1" opacity=".5"/>
+      <circle cx="198" cy="34" r="1.4" opacity=".6"/>
+      <circle cx="222" cy="66" r="1" opacity=".5"/>
+      <circle cx="30" cy="92" r="1" opacity=".4"/>
+    </g>
+
+    <!-- the zero-price moon: the only thing allowed across -->
+    <circle cx="128" cy="86" r="46" fill="url(#glow)"/>
+    <circle cx="128" cy="86" r="25" fill="#ffe9a8"/>
+    <text x="128" y="96" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="29" font-weight="700" fill="#2a1f5c">0</text>
+
+    <!-- water -->
+    <rect y="176" width="256" height="80" fill="#0b2433" opacity=".55"/>
+    <g stroke="#5ee6c8" stroke-linecap="round" opacity=".35" stroke-width="2.5">
+      <path d="M52 204h34M118 212h44M190 202h22M72 226h26M150 232h40"/>
+    </g>
+    <g stroke="#ffe9a8" stroke-linecap="round" opacity=".45" stroke-width="3">
+      <path d="M114 188h28M119 197h18M124 222h8"/>
+    </g>
+
+    <!-- bridge -->
+    <g fill="none" stroke="url(#steel)" stroke-linecap="round">
+      <path d="M30 170 Q128 50 226 170" stroke-width="9"/>
+      <g stroke-width="3.5" opacity=".9">
+        <path d="M62 170v-30M95 170v-56M128 170v-60M161 170v-56M194 170v-30"/>
+      </g>
+      <path d="M18 170h220" stroke-width="10"/>
+    </g>
+
+    <!-- left bank: pi -->
+    <g transform="translate(12 128)">
+      <rect width="40" height="40" rx="11" fill="#ff7ab6"/>
+      <path d="M9 13h22M16 13v17M25 13v12c0 3 1.5 5 4 5" fill="none" stroke="#1b1640" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- right bank: code braces -->
+    <g transform="translate(204 128)">
+      <rect width="40" height="40" rx="11" fill="#5ee6c8"/>
+      <path d="M16 10c-4 0-5 2-5 5v3c0 2-1 2.5-3 2.5 2 0 3 .5 3 2.5v3c0 3 1 5 5 5M24 10c4 0 5 2 5 5v3c0 2 1 2.5 3 2.5-2 0-3 .5-3 2.5v3c0 3-1 5-5 5" fill="none" stroke="#1b1640" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,159 @@
+{
+  "checked_date": "2026-09-20",
+  "timezone": "Europe/Kyiv",
+  "source_policy": "Primary documentation and repositories. PR statements are attributed to their authors, not represented as our own live tests.",
+  "pr_heads": {
+    "12326": "459ecc1f19ab1120b58b62f491f05f45b0745682",
+    "12556": "2bcaf7b0f1c8afa46cb78c3b38bc35e739c41429"
+  },
+  "sources": [
+    {
+      "id": "omp-pr-12326",
+      "title": "OMP PR #12326",
+      "url": "https://github.com/can1357/oh-my-pi/pull/12326",
+      "relevance": "Client identity and session-token changes; author-reported live tests; open/not merged at research time."
+    },
+    {
+      "id": "omp-pr-12556",
+      "title": "OMP PR #12556",
+      "url": "https://github.com/can1357/oh-my-pi/pull/12556",
+      "relevance": "Tool roster padding and error handling; reported live A/B ends in HTTP 429, not successful inference; open/not merged."
+    },
+    {
+      "id": "omp-issue-12306",
+      "title": "OMP issue #12306",
+      "url": "https://github.com/can1357/oh-my-pi/issues/12306",
+      "relevance": "Community reports of free-tier restrictions."
+    },
+    {
+      "id": "gate-bisection",
+      "title": "Four-condition community bisection",
+      "url": "https://github.com/can1357/oh-my-pi/issues/12306#issuecomment-5726093352",
+      "relevance": "Reported individual removal of identity, session, stream and core tool-name conditions."
+    },
+    {
+      "id": "account-block-report",
+      "title": "Account restriction report",
+      "url": "https://github.com/can1357/oh-my-pi/issues/12306#issuecomment-5713586792",
+      "relevance": "One contributor reports user_blocked after testing; causation is not established; distinguishes API-key and Console OAuth lanes."
+    },
+    {
+      "id": "pinned-wire-helper",
+      "title": "PR #12556 exact wire helper",
+      "url": "https://raw.githubusercontent.com/palprateek/oh-my-pi/2bcaf7b0f1c8afa46cb78c3b38bc35e739c41429/packages/catalog/src/wire/opencode.ts",
+      "relevance": "Pinned implementation of identity and missing core tool-name padding; source observation, not official OpenCode policy."
+    },
+    {
+      "id": "opencode-zen",
+      "title": "Official Zen documentation",
+      "url": "https://opencode.ai/docs/zen/",
+      "relevance": "Endpoints, explicit Free prices, System One/Jev API, privacy."
+    },
+    {
+      "id": "opencode-go",
+      "title": "Official Go documentation",
+      "url": "https://opencode.ai/docs/go/",
+      "relevance": "Outside-client support, own User-Agent/session requirements, included subscription usage versus zero-cost models, Use balance."
+    },
+    {
+      "id": "zen-model-list",
+      "title": "Live Zen model listing",
+      "url": "https://opencode.ai/zen/v1/models",
+      "relevance": "Public model presence, not proof of account entitlement, generation or current billing."
+    },
+    {
+      "id": "go-model-list",
+      "title": "Live Go model listing",
+      "url": "https://opencode.ai/zen/go/v1/models",
+      "relevance": "Separate Go model presence; no lane substitution."
+    },
+    {
+      "id": "models-dev-api",
+      "title": "models.dev public API",
+      "url": "https://models.dev/api.json",
+      "relevance": "Runtime metadata source used by the package. Full API download was unavailable from the code-execution environment; primary repository rows were read with web tools."
+    },
+    {
+      "id": "muse-13-free-metadata",
+      "title": "Muse 1.3 Contributor Free metadata",
+      "url": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode/models/muse-spark-1.3-contributor-free.toml",
+      "relevance": "Zero input/output/cache-read costs, Responses SDK, capabilities and limits."
+    },
+    {
+      "id": "muse-12-free-metadata",
+      "title": "Muse 1.2 Contributor Free metadata",
+      "url": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode/models/muse-spark-1.2-contributor-free.toml",
+      "relevance": "Zero costs; Responses SDK."
+    },
+    {
+      "id": "deepseek-free-metadata",
+      "title": "DeepSeek V4 Flash Free metadata",
+      "url": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode/models/deepseek-v4-flash-free.toml",
+      "relevance": "Zero costs but deprecated status; listing alone is not proof of successful inference."
+    },
+    {
+      "id": "omen-go-metadata",
+      "title": "Omen Alpha Go metadata",
+      "url": "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/opencode-go/models/omen-alpha.toml",
+      "relevance": "Nonzero prices: this ID is not free merely because it is an alpha."
+    },
+    {
+      "id": "omp-models",
+      "title": "OMP model/provider configuration",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/docs/models.md",
+      "relevance": "Custom models, API variants and global model config paths."
+    },
+    {
+      "id": "omp-extensions",
+      "title": "OMP extensions documentation",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md",
+      "relevance": "Native registration, tools, commands and payload hooks."
+    },
+    {
+      "id": "omp-extension-loading",
+      "title": "OMP extension loading",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md",
+      "relevance": "Explicit -e module loading; no dependency on OpenCode CLI."
+    },
+    {
+      "id": "omp-extension-types",
+      "title": "OMP ExtensionAPI types",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/extensions/types.ts",
+      "relevance": "ProviderConfig/ProviderModelConfig, per-model api and direct payload-hook replacement."
+    },
+    {
+      "id": "omp-model-registry",
+      "title": "OMP native model registry",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/config/model-registry.ts",
+      "relevance": "Provider replacement, same-ID model lookup and extension registration."
+    },
+    {
+      "id": "omp-catalog-types",
+      "title": "OMP wire compatibility types",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/types.ts",
+      "relevance": "compat.extraBody, reasoning/history options."
+    },
+    {
+      "id": "omp-inference-headers",
+      "title": "OMP shared inference identity",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/providers/inference-headers.ts",
+      "relevance": "Protocol/provider-specific session headers; custom-provider helper fallback is needed."
+    },
+    {
+      "id": "omp-anthropic",
+      "title": "OMP Anthropic transport",
+      "url": "https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/providers/anthropic.ts",
+      "relevance": "normalizeAnthropicBaseUrl strips trailing /v1; auth/session handling."
+    }
+  ],
+  "reddit_search": {
+    "performed": true,
+    "queries": [
+      "site:reddit.com OpenCode free tier OMP",
+      "site:reddit.com oh-my-pi FreeTierError",
+      "site:reddit.com oh-my-pi 12326 12556",
+      "site:reddit.com OpenCode Go alternatives"
+    ],
+    "conclusion": "No sufficiently specific independent native-OMP/free-SKU/zero-balance success report was found in the performed searches. This is not a claim that none exists."
+  }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenCode Free loopback bridge for OMP
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/omp-free-bridge
+ExecStart=/usr/bin/python3 %h/.local/share/omp-free-bridge/bridge.py serve --port 8765 --compat-opencode
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
