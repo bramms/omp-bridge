@@ -1,4 +1,5 @@
 """Offline unit + real loopback HTTP tests. No provider credentials or external calls."""
+import calendar
 import copy
 import io
 import json
@@ -310,6 +311,13 @@ class CoreTests(unittest.TestCase):
         self.assertIn('NOT a successful', str(exc))
         self.assertGreaterEqual(wait, 60)
 
+    def test_quota_reset_names_utc_time_and_remaining_wait(self):
+        # The live 429 of 2026-10-18 18:40:16 UTC carried Retry-After: 19184.
+        now = float(calendar.timegm((2026, 10, 18, 18, 40, 16, 0, 0, 0)))
+        text = b.quota_reset(now + 19184, now)
+        self.assertIn('2026-10-19 00:00 UTC', text)
+        self.assertIn('in 5h 19m', text)
+
     def test_private_file_permissions_and_symlink(self):
         with tempfile.TemporaryDirectory() as root:
             p = Path(root) / 'key'
@@ -563,6 +571,42 @@ class HTTPTests(unittest.TestCase):
         self.assertIn(b'NOT a successful', raw)
         self.assertEqual(self.request()[0], 409)
         self.assertEqual(len(self.calls), 1)
+
+    def test_free_quota_429_pauses_the_whole_zen_lane(self):
+        # Zen's free quota is shared by every model: switching models must not re-hit upstream.
+        self.response = FakeResponse(b'{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}',
+                                     429, {'Retry-After': '19184'})
+        status, raw = self.request()
+        self.assertEqual(status, 429)
+        self.assertIn(b'Resets at', raw)
+        status, raw = self.request({'model': 'demo-responses', 'stream': True, 'input': 'x', '_omp_free_session': 'x'},
+                                   path='/zen/v1/responses')
+        self.assertEqual(status, 409)
+        self.assertIn(b'Resets at', raw)
+        self.assertIn(b'FreeQuotaCooldown', raw)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_free_quota_cooldown_honors_retry_after_beyond_an_hour(self):
+        self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError","message":"Limit"}}', 429, {'Retry-After': '19184'})
+        self.request()
+        self.assertGreater(self.server.lane_cooldowns['zen'] - time.time(), 19000)
+
+    def test_free_quota_cooldown_leaves_go_lane_alone(self):
+        self.server.catalog.data['models'].append(dict(self.server.catalog.data['models'][0], lane='go'))
+        self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError","message":"Limit"}}', 429, {'Retry-After': '600'})
+        self.request()
+        self.response = FakeResponse(frame({'choices': [{'delta': {'content': 'BRIDGE_OK'}}]}) + b'data: [DONE]\n\n')
+        self.assertEqual(self.request(path='/go/v1/chat/completions')[0], 200)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_other_429_keeps_a_per_model_cooldown(self):
+        self.response = FakeResponse(b'{"error":{"type":"RateLimitError","message":"Slow down"}}', 429, {'Retry-After': '90'})
+        self.request()
+        self.response = FakeResponse(frame({'choices': [{'delta': {'content': 'BRIDGE_OK'}}]}) + b'data: [DONE]\n\n')
+        status, _ = self.request({'model': 'demo-responses', 'stream': True, 'input': 'x', '_omp_free_session': 'x'},
+                                 path='/zen/v1/responses')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.calls), 2)
 
     def test_redirect_not_followed(self):
         self.response = FakeResponse(b'', 302, {'Location': 'https://evil.invalid'})

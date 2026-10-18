@@ -545,6 +545,15 @@ def error_info(status: int, raw: bytes, key: str) -> tuple[BridgeError, float]:
     return BridgeError(text, status, code), wait
 
 
+def quota_reset(until: float, now: float | None = None) -> str:
+    left = max(0, int(until - (time.time() if now is None else now)))
+    stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(round(until)))
+    return f"Resets at {stamp} (in {left // 3600}h {left % 3600 // 60}m)"
+
+
+LANE_NAMES = {"zen": "OpenCode Zen", "go": "OpenCode Go"}
+
+
 class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -554,13 +563,17 @@ class BridgeServer(ThreadingHTTPServer):
         self.catalog, self.key, self.token = catalog, key, token
         self.compat, self.ua_version = compat, ua_version
         self.connector = connector or (lambda: http.client.HTTPSConnection("opencode.ai", timeout=120, context=ssl.create_default_context()))
-        self.cooldowns, self.blocked = {}, {}
+        self.cooldowns, self.lane_cooldowns, self.blocked = {}, {}, {}
         self.lock = threading.Lock()
 
     def check_model(self, lane: str, model_id: str, endpoint: str):
         with self.lock:
             if lane in self.blocked:
                 raise BridgeError("Lane stopped after upstream auth/policy/payment denial. Resolve the cause, then restart the bridge.", 409, "UpstreamLaneStopped")
+            until = self.lane_cooldowns.get(lane, 0)
+            if time.time() < until:
+                raise BridgeError(f"{LANE_NAMES[lane]} free quota is exhausted for every model. {quota_reset(until)}. "
+                                  "No upstream call was made.", 409, "FreeQuotaCooldown")
             if time.time() < self.cooldowns.get((lane, model_id), 0):
                 raise BridgeError("Model is in local cooldown after HTTP 429. No upstream call was made.", 409, "LocalCooldown")
         if not any(row["lane"] == lane and row["id"] == model_id and row["endpoint"] == endpoint
@@ -699,16 +712,23 @@ class Handler(BaseHTTPRequestHandler):
             response = conn.getresponse()
             if response.status != 200:
                 exc, wait = error_info(response.status, response.read(16384), self.server.key)
-                if response.status == 429:
-                    retry = response.getheader("Retry-After", "")
-                    if retry.isdigit():
-                        # A day-long local cooldown can only be cleared by a restart,
-                        # which is the one thing this bridge tells users not to do.
-                        wait = max(wait, min(int(retry), 3600))
+                retry = response.getheader("Retry-After", "") if response.status == 429 else ""
+                # The free quota is shared by every model of the lane and upstream names its
+                # reset in Retry-After (midnight UTC), so honor it in full for the whole lane.
+                lane_quota = response.status == 429 and exc.code == "FreeUsageLimitError"
+                if lane_quota:
+                    wait = max(wait, int(retry)) if retry.isdigit() else wait
+                    exc = BridgeError(f"{exc} {quota_reset(time.time() + wait)}.", exc.status, exc.code)
+                elif retry.isdigit():
+                    # A day-long per-model cooldown can only be cleared by a restart,
+                    # which is the one thing this bridge tells users not to do.
+                    wait = max(wait, min(int(retry), 3600))
                 with self.server.lock:
                     if response.status in {401, 402, 403}:
                         self.server.blocked[lane] = response.status
-                    if wait:
+                    if lane_quota:
+                        self.server.lane_cooldowns[lane] = time.time() + wait
+                    elif wait:
                         self.server.cooldowns[(lane, model_id)] = time.time() + wait
                 raise exc
             if "text/event-stream" not in response.getheader("Content-Type", "").lower():
