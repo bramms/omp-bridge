@@ -1,11 +1,14 @@
 """Offline unit + real loopback HTTP tests. No provider credentials or external calls."""
 import calendar
+import contextlib
 import copy
 import io
 import json
 import os
 from pathlib import Path
 import socket
+import socketserver
+import ssl
 import sys
 import tempfile
 import threading
@@ -52,6 +55,85 @@ def real_tools(endpoint='chat/completions'):
 
 
 class CoreTests(unittest.TestCase):
+    def test_proxy_config_accepts_http_hosts_and_ipv6(self):
+        self.assertEqual(b.parse_proxy('http://127.0.0.1:18090'), ('127.0.0.1', 18090))
+        self.assertEqual(b.parse_proxy('http://proxy.local:8080/'), ('proxy.local', 8080))
+        self.assertEqual(b.parse_proxy('http://[::1]:40000'), ('::1', 40000))
+
+    def test_invalid_proxy_is_rejected_before_credentials_or_network(self):
+        invalid = ['', '127.0.0.1:80', 'https://proxy:80', 'socks5://proxy:80',
+                   'http://proxy', 'http://proxy:0', 'http://proxy:65536', 'http://proxy:abc',
+                   'http://:80', 'http://[::1:80', 'http://user:secret@proxy:80',
+                   'http://proxy:80/path', 'http://proxy:80?', 'http://proxy:80#',
+                   ' http://proxy:80', 'http://proxy:80\r\nHost: injected']
+        with patch.object(b, 'key_from_user') as key, patch.object(b, 'Catalog') as catalog:
+            for value in invalid:
+                with self.subTest(value=value), self.assertRaises(b.BridgeError):
+                    b.main(['serve', '--zen-proxy', value])
+            key.assert_not_called()
+            catalog.assert_not_called()
+
+    def test_duplicate_or_four_proxy_endpoints_are_rejected_before_network(self):
+        for ports in ([18090, 18090], [18090, 18091, 18092, 18093]):
+            args = ['serve']
+            for port in ports:
+                args += ['--zen-proxy', f'http://127.0.0.1:{port}']
+            with patch.object(b, 'key_from_user') as key, patch.object(b, 'Catalog') as catalog:
+                with self.assertRaises(b.BridgeError):
+                    b.main(args)
+                key.assert_not_called()
+                catalog.assert_not_called()
+
+    def test_serve_cli_passes_all_three_proxies(self):
+        args = ['serve']
+        for port in range(18090, 18093):
+            args += ['--zen-proxy', f'http://127.0.0.1:{port}']
+        with patch.object(b, 'BridgeServer') as server, patch.object(b, 'Catalog', return_value=StaticCatalog()), \
+             patch.object(b, 'key_from_user', return_value=''), patch.object(b, 'token_from_user', return_value='L' * 40), \
+             patch.object(b, 'save_private'), patch('builtins.print'):
+            self.assertEqual(b.main(args), 0)
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], tuple(('127.0.0.1', p) for p in range(18090, 18093)))
+
+    def test_serve_loads_saved_pool_and_cli_can_override_it(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(b, 'STATE', Path(root)), \
+             patch.object(b, 'BridgeServer') as server, patch.object(b, 'Catalog', return_value=StaticCatalog()), \
+             patch.object(b, 'key_from_user', return_value=''), patch.object(b, 'token_from_user', return_value='L' * 40), \
+             patch.object(b, 'save_private'), patch('builtins.print'):
+            config = Path(root) / 'zen-proxies.json'
+            config.write_text(json.dumps([f'http://127.0.0.1:{p}' for p in range(18090, 18093)]))
+            self.assertEqual(b.main(['serve']), 0)
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], tuple(('127.0.0.1', p) for p in range(18090, 18093)))
+            config.write_text('broken JSON')
+            self.assertEqual(b.main(['serve', '--zen-proxy', 'http://127.0.0.1:18092']), 0)
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], (('127.0.0.1', 18092),))
+            config.write_text('[]')
+            self.assertEqual(b.main(['serve']), 0)
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], ())
+            config.unlink()
+            self.assertEqual(b.main(['serve']), 0)
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], ())
+
+    def test_bad_saved_pool_is_rejected_before_credentials_or_network(self):
+        invalid = ['{', 'null', '{}', '"http://proxy:80"', '[false]',
+                   '["https://proxy:80"]', '["http://proxy:80", "http://proxy:80"]',
+                   '["http://a:80", "http://b:80", "http://c:80", "http://d:80"]']
+        with tempfile.TemporaryDirectory() as root, patch.object(b, 'STATE', Path(root)), \
+             patch.object(b, 'key_from_user') as key, patch.object(b, 'Catalog') as catalog:
+            for raw in invalid:
+                (Path(root) / 'zen-proxies.json').write_text(raw)
+                with self.subTest(config=raw), self.assertRaises(b.BridgeError):
+                    b.main(['serve'])
+            key.assert_not_called()
+            catalog.assert_not_called()
+
+    def test_unreadable_saved_pool_does_not_fall_back_to_direct(self):
+        with patch.object(Path, 'read_bytes', side_effect=PermissionError), \
+             patch.object(b, 'key_from_user') as key, patch.object(b, 'Catalog') as catalog:
+            with self.assertRaisesRegex(b.BridgeError, 'no direct fallback'):
+                b.main(['serve'])
+            key.assert_not_called()
+            catalog.assert_not_called()
+
     def test_metadata_placeholders_and_retired_editions_are_not_free(self):
         for update in ({'name': 'Unpriced preview'}, {'status': 'deprecated'}):
             meta = metadata()
@@ -379,6 +461,60 @@ class StaticCatalog:
     def get(self): return copy.deepcopy(self.data)
 
 
+@contextlib.contextmanager
+def connect_proxy(reject=False):
+    """Loopback CONNECT endpoint followed by a real, certificate-checked TLS origin."""
+    fixture = Path(__file__).parent / 'fixtures/connect-test.pem'
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(fixture)
+
+    class Proxy(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.connection.settimeout(3)
+            self.server.connects.append((self.rfile.readline(), dict(http.client.parse_headers(self.rfile))))
+            if reject:
+                self.wfile.write(b'HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n')
+                return
+            self.wfile.write(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            try:
+                with tls.wrap_socket(self.connection, server_side=True) as origin:
+                    with origin.makefile('rb') as stream:
+                        line = stream.readline()
+                        headers = http.client.parse_headers(stream)
+                        body = stream.read(int(headers['Content-Length']))
+                        self.server.posts.append((line, dict(headers), b.load_json(body)))
+                        if self.server.quota:
+                            raw = b'{"error":{"type":"FreeUsageLimitError","message":"Test quota exhausted"}}'
+                            origin.sendall(b'HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n'
+                                           b'Retry-After: 19184\r\n' + f'Content-Length: {len(raw)}\r\n\r\n'.encode() + raw)
+                            return
+                        first = frame({'choices': [{'delta': {'content': 'BRIDGE_OK'}}]})
+                        last = b'data: [DONE]\n\n'
+                        origin.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
+                                       + f'Content-Length: {len(first) + len(last)}\r\n\r\n'.encode() + first)
+                        self.server.release.wait(2)
+                        origin.sendall(last)
+            except OSError:
+                pass  # A rejected certificate intentionally ends the TLS handshake.
+
+    server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Proxy)
+    server.daemon_threads = True
+    server.connects, server.posts, server.names = [], [], []
+    server.quota = False
+    server.release = threading.Event()
+    server.release.set()
+    tls.set_servername_callback(lambda sock, name, context: server.names.append(name))
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+    thread.start()
+    try:
+        yield server, ssl.create_default_context(cafile=str(fixture))
+    finally:
+        server.release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
@@ -404,7 +540,7 @@ class HTTPTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(2)
 
-    def request(self, payload=None, path='/zen/v1/chat/completions', headers=None):
+    def request(self, payload=None, path='/zen/v1/chat/completions', headers=None, with_headers=False):
         conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=3)
         h = {'Authorization': 'Bearer ' + 'L' * 40, 'Content-Type': 'application/json'}
         h.update(headers or {})
@@ -412,8 +548,188 @@ class HTTPTests(unittest.TestCase):
         conn.request('POST', path, b.encode(data), h)
         r = conn.getresponse()
         result = (r.status, r.read())
+        if with_headers:
+            result += (dict(r.getheaders()),)
         conn.close()
         return result
+
+    def set_proxies(self, *proxies):
+        self.server.zen_proxies = tuple(proxies)
+        self.server.proxy_until = [0.0] * len(proxies)
+
+    def test_pool_sticky_distribution_and_bounded_memory(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        chosen = {self.server.select_proxy('zen', f'session-{i}') for i in range(50)}
+        self.assertEqual(chosen, {0, 1, 2})
+        first = self.server.select_proxy('zen', 'stable')
+        self.assertEqual(self.server.select_proxy('zen', 'stable'), first)
+        self.assertIsNone(self.server.select_proxy('go', 'stable'))
+        for i in range(10001):
+            self.server.select_proxy('zen', str(i))
+        self.assertEqual(len(self.server.session_proxies), 10000)
+
+    def test_pool_quota_failover_is_on_next_request_and_stays_after_recovery(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError"}}', 429, {'Retry-After': '19184'})
+            status, _, headers = self.request(with_headers=True)
+            self.assertEqual(status, 429)
+            self.assertEqual(connect.call_count, 1)
+            first = self.server.zen_proxies.index(connect.call_args.args[0])
+            self.assertEqual(headers['X-OMP-Zen-Proxy'], str(first + 1))
+            self.assertGreater(self.server.proxy_until[first] - time.time(), 19000)
+            self.assertFalse(self.server.lane_cooldowns)
+            self.assertFalse(self.server.cooldowns)
+            for _ in range(2):
+                self.response = FakeResponse(b'data: [DONE]\n\n')
+                status, _, headers = self.request(with_headers=True)
+                self.assertEqual(status, 200)
+                self.assertNotEqual(headers['X-OMP-Zen-Proxy'], str(first + 1))
+                self.server.proxy_until[first] = 0  # Primary recovers before the third request.
+            routes = [call.args[0] for call in connect.call_args_list]
+            self.assertNotEqual(routes[0], routes[1])
+            self.assertEqual(routes[1], routes[2])
+            self.assertEqual(len(self.calls), 3)
+            self.assertEqual(len({call['headers']['x-opencode-session'] for call in self.calls}), 1)
+
+    def test_pool_all_cooling_is_local_and_go_stays_direct(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            for _ in range(3):
+                self.response = FakeResponse(b'{"error":{"type":"RateLimitError"}}', 429)
+                self.assertEqual(self.request()[0], 429)
+            status, raw = self.request()
+            self.assertEqual(status, 503)
+            self.assertIn(b'ZenProxyCooldown', raw)
+            self.assertEqual(len({call.args[0] for call in connect.call_args_list}), 3)
+            self.assertEqual(len(self.calls), 3)
+            health = self.get('/health')[1]
+            self.assertTrue(health['zen_proxy'])
+            self.assertEqual([p['id'] for p in health['zen_proxies']], [1, 2, 3])
+            self.assertTrue(all(p['cooldown_seconds'] > 0 for p in health['zen_proxies']))
+            self.server.catalog.data['models'].append(dict(self.server.catalog.data['models'][0], lane='go'))
+            self.response = FakeResponse(b'data: [DONE]\n\n')
+            self.assertEqual(self.request(path='/go/v1/chat/completions')[0], 200)
+            self.assertEqual(connect.call_count, 3)
+            self.assertEqual(len(self.calls), 4)
+            self.server.proxy_until[1] = 0
+            self.response = FakeResponse(b'data: [DONE]\n\n')
+            self.assertEqual(self.request()[0], 200)
+            self.assertEqual(connect.call_args.args[0], ('b', 80))
+
+    def test_pool_transport_failure_switches_next_request_without_replay(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=[OSError('offline'), self.server.connector()]) as connect:
+            self.assertEqual(self.request()[0], 502)
+            self.assertEqual(connect.call_count, 1)
+            self.assertEqual(self.request()[0], 200)
+            self.assertNotEqual(connect.call_args_list[0].args, connect.call_args_list[1].args)
+            self.assertEqual(len(self.calls), 1)
+
+    def test_pool_5xx_cools_exit_without_shortening_existing_quota(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            self.response = FakeResponse(b'{"error":{"message":"Unavailable"}}', 503)
+            self.assertEqual(self.request()[0], 503)
+            first = self.server.zen_proxies.index(connect.call_args.args[0])
+            self.assertGreater(self.server.proxy_until[first] - time.time(), 29)
+            self.server.cool_proxy(first, 19000)
+            until = self.server.proxy_until[first]
+            self.server.cool_proxy(first, 30)
+            self.assertEqual(self.server.proxy_until[first], until)
+            self.response = FakeResponse(b'data: [DONE]\n\n')
+            self.assertEqual(self.request()[0], 200)
+            self.assertEqual(self.server.proxy_until[first], until)
+
+    def test_pool_policy_denial_stops_all_exits(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            self.response = FakeResponse(b'{"error":{"type":"FreeTierError"}}', 403)
+            self.assertEqual(self.request()[0], 403)
+            self.assertEqual(self.request()[0], 409)
+            self.assertEqual(connect.call_count, 1)
+            self.assertFalse(any(self.server.proxy_until))
+
+    def test_pool_truncated_sse_is_not_replayed(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            self.response = FakeResponse(frame({'choices': [{'delta': {'content': 'partial'}}]}))
+            status, raw = self.request()
+            self.assertEqual(status, 200)
+            self.assertIn(b'TruncatedStream', raw)
+            self.assertEqual(connect.call_count, 1)
+            self.assertEqual(len(self.calls), 1)
+            self.response = FakeResponse(b'data: [DONE]\n\n')
+            self.assertEqual(self.request()[0], 200)
+            self.assertNotEqual(connect.call_args_list[0].args, connect.call_args_list[1].args)
+
+    def test_pool_midstream_reset_cools_exit_without_replay(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        first = frame({'choices': [{'delta': {'content': 'partial'}}]})
+        class Resetting(FakeResponse):
+            def readline(self, limit=-1):
+                if self.tell() >= len(first):
+                    raise ConnectionResetError('upstream reset during SSE')
+                return super().readline(limit)
+        with patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector()) as connect:
+            self.response = Resetting(first)
+            status, raw = self.request()
+            self.assertEqual(status, 200)
+            self.assertIn(b'partial', raw)
+            self.assertIn(b'BridgeTransportError', raw)
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(connect.call_count, 1)
+            self.response = FakeResponse(b'data: [DONE]\n\n')
+            self.assertEqual(self.request()[0], 200)
+            self.assertNotEqual(connect.call_args_list[0].args, connect.call_args_list[1].args)
+
+    def test_pool_does_not_bypass_admission(self):
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        with patch.object(b, 'upstream_connection') as connect:
+            self.assertEqual(self.request({'model': 'paid', 'stream': True, '_omp_free_session': 'test'})[0], 403)
+            connect.assert_not_called()
+            self.assertFalse(self.server.session_proxies)
+
+    def test_three_real_connect_exits_keep_session_and_fail_over(self):
+        with contextlib.ExitStack() as stack:
+            nodes = [stack.enter_context(connect_proxy()) for _ in range(3)]
+            self.set_proxies(*(proxy.server_address for proxy, _ in nodes))
+            stack.enter_context(patch.object(b.ssl, 'create_default_context', return_value=nodes[0][1]))
+            first = self.server.select_proxy('zen', b.session_token('http-test'))
+            self.assertEqual(self.request()[0], 200)
+            self.assertEqual(self.request()[0], 200)
+            self.assertEqual([len(proxy.posts) for proxy, _ in nodes], [2 if i == first else 0 for i in range(3)])
+            self.server.cool_proxy(first, 60)
+            self.assertEqual(self.request()[0], 200)
+            second = (first + 1) % 3
+            self.assertEqual(len(nodes[second][0].posts), 1)
+            self.assertFalse(self.calls)
+
+    def test_real_connect_quota_switches_same_session_to_success(self):
+        with contextlib.ExitStack() as stack:
+            nodes = [stack.enter_context(connect_proxy()) for _ in range(3)]
+            self.set_proxies(*(proxy.server_address for proxy, _ in nodes))
+            stack.enter_context(patch.object(b.ssl, 'create_default_context', return_value=nodes[0][1]))
+            first = self.server.select_proxy('zen', b.session_token('http-test'))
+            nodes[first][0].quota = True
+            status, raw, headers = self.request(with_headers=True)
+            self.assertEqual(status, 429)
+            self.assertIn(b'FreeUsageLimitError', raw)
+            self.assertEqual(headers['X-OMP-Zen-Proxy'], str(first + 1))
+            self.assertEqual(sum(len(proxy.posts) for proxy, _ in nodes), 1)
+            self.assertGreater(self.server.proxy_until[first] - time.time(), 19000)
+            # No manual cooldown, session replacement, connector stub or server restart.
+            status, raw, headers = self.request(with_headers=True)
+            second = (first + 1) % 3
+            self.assertEqual(status, 200)
+            self.assertIn(b'BRIDGE_OK', raw)
+            self.assertIn(b'[DONE]', raw)
+            self.assertEqual(headers['X-OMP-Zen-Proxy'], str(second + 1))
+            a, c = nodes[first][0].posts[0], nodes[second][0].posts[0]
+            self.assertEqual(a[2], c[2])
+            self.assertEqual(a[1]['x-opencode-session'], c[1]['x-opencode-session'])
+            self.assertEqual(sum(len(proxy.posts) for proxy, _ in nodes), 2)
+            self.assertFalse(self.calls)
 
     def test_pre_stream_error_uses_the_endpoint_error_shape(self):
         status, body = self.request({'model': 'demo-messages', 'stream': False, '_omp_free_session': 'x'},
@@ -440,6 +756,67 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.calls[0]['path'], '/inference/openai/v1/chat/completions')
         self.assertEqual(self.calls[0]['headers']['Authorization'], 'Bearer public')
         self.assertNotIn('_omp_free_session', self.calls[0]['body'])
+
+    def test_connect_proxy_keeps_origin_tls_and_incremental_sse(self):
+        with connect_proxy() as (proxy, trusted), patch.object(b.ssl, 'create_default_context', return_value=trusted):
+            self.set_proxies(proxy.server_address)
+            proxy.release.clear()
+            conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=3)
+            self.addCleanup(conn.close)
+            payload = {'model': 'demo-chat-completions', 'stream': True,
+                       'tools': real_tools(), '_omp_free_session': 'connect-test'}
+            conn.request('POST', '/zen/v1/chat/completions', b.encode(payload),
+                         {'Authorization': 'Bearer ' + 'L' * 40})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn(b'BRIDGE_OK', response.readline())
+            self.assertFalse(proxy.release.is_set())
+            proxy.release.set()
+            self.assertIn(b'[DONE]', response.read())
+            self.assertEqual(len(proxy.connects), 1)
+            self.assertTrue(proxy.connects[0][0].startswith(b'CONNECT opencode.ai:443 HTTP/'))
+            self.assertNotIn('Authorization', proxy.connects[0][1])
+            self.assertEqual(proxy.names, ['opencode.ai'])
+            self.assertEqual(len(proxy.posts), 1)
+            line, headers, body = proxy.posts[0]
+            self.assertTrue(line.startswith(b'POST /inference/openai/v1/chat/completions '))
+            self.assertEqual(headers['Host'], 'opencode.ai')
+            self.assertEqual(headers['Authorization'], 'Bearer public')
+            self.assertEqual(body['tools'], payload['tools'])
+            self.assertNotIn('_omp_free_session', body)
+            self.assertFalse(self.calls)  # Direct connector was never used.
+
+    def test_connect_denial_does_not_retry_fall_back_or_block_zen(self):
+        with connect_proxy(reject=True) as (proxy, _):
+            self.set_proxies(proxy.server_address)
+            status, raw = self.request()
+            self.assertEqual(status, 502)
+            self.assertIn(b'BridgeTransportError', raw)
+            self.assertEqual(len(proxy.connects), 1)
+            self.assertFalse(proxy.posts)
+            self.assertFalse(self.calls)
+            self.assertFalse(self.server.blocked)
+
+    def test_connect_requires_a_trusted_origin_certificate(self):
+        with connect_proxy() as (proxy, _):
+            self.set_proxies(proxy.server_address)
+            status, raw = self.request()
+            self.assertEqual(status, 502)
+            self.assertIn(b'SSLCertVerificationError', raw)
+            self.assertFalse(proxy.posts)
+            self.assertFalse(self.calls)
+
+    def test_unreachable_zen_proxy_leaves_go_direct(self):
+        with socket.socket() as unused:
+            unused.bind(('127.0.0.1', 0))  # Reserved but not listening: connection refused.
+            self.set_proxies(unused.getsockname())
+            unused.close()
+            self.assertEqual(self.request()[0], 502)
+            self.assertFalse(self.calls)
+            self.server.catalog.data['models'].append(dict(self.server.catalog.data['models'][0], lane='go'))
+            self.assertEqual(self.request(path='/go/v1/chat/completions')[0], 200)
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(self.calls[0]['headers']['Authorization'], 'Bearer test-upstream-key-ONLY-FIXTURE')
 
     def get(self, path):
         conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=3)
@@ -649,9 +1026,19 @@ class HTTPTests(unittest.TestCase):
         first = frame({'choices': [{'delta': {'content': 'first'}}]})
         class Gated(FakeResponse):
             def readline(self, limit=-1):
-                if self.tell() >= len(first): outer.release_stream.wait(2)
+                if self.tell() >= len(first):
+                    outer.release_stream.wait(2)
+                    return b''  # A real shutdown can produce EOF without [DONE].
                 return super().readline(limit)
         self.response = Gated(first + b'data: [DONE]\n\n')
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        proxy_patch = patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector())
+        proxy_patch.start()
+        self.addCleanup(proxy_patch.stop)
+        handled = threading.Event()
+        fail_patch = patch.object(b.Handler, 'fail', autospec=True, side_effect=lambda *args: handled.set())
+        failed = fail_patch.start()
+        self.addCleanup(fail_patch.stop)
         conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=2)
         conn.request('POST', '/zen/v1/chat/completions', b.encode({'model': 'demo-chat-completions', 'stream': True, '_omp_free_session': 's'}),
                      {'Authorization': 'Bearer ' + 'L' * 40})
@@ -660,6 +1047,9 @@ class HTTPTests(unittest.TestCase):
         response.close()
         conn.close()
         self.assertTrue(self.closed.wait(1.5), 'upstream was not cancelled after client disconnect')
+        self.assertTrue(handled.wait(1.5), 'EOF after shutdown must be handled')
+        self.assertEqual(failed.call_args.args[1].code, 'TruncatedStream')
+        self.assertFalse(any(self.server.proxy_until), 'client cancellation must not cool an exit')
 
     def test_parallel_requests_all_reach_upstream(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -679,10 +1069,15 @@ class HTTPTests(unittest.TestCase):
                 pass
 
         self.server.connector = Connection
+        self.set_proxies(('a', 80), ('b', 80), ('c', 80))
+        proxy_patch = patch.object(b, 'upstream_connection', side_effect=lambda _: self.server.connector())
+        proxy_patch.start()
+        self.addCleanup(proxy_patch.stop)
         with ThreadPoolExecutor(max_workers=count) as pool:
             results = list(pool.map(lambda _: self.request(), range(count)))
         self.assertEqual(len(calls), count)
         self.assertEqual([status for status, _ in results], [200] * count)
+        self.assertEqual(len(set(self.server.session_proxies.values())), 1)
         self.assertTrue(all(b'LocalConcurrencyLimit' not in body for _, body in results))
 
     def test_no_upstream_secret_in_errors(self):

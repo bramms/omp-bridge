@@ -78,13 +78,13 @@ omp -e ~/.local/share/omp-free-bridge/extension.mjs --model opencode-zen-free/bi
 
 | Файл | Розмір | Роль |
 |---|---|---|
-| [`bridge.py`](bridge.py) | ~880 рядків | Локальний HTTP, каталог, перевірка ціни, TLS до OpenCode, SSE |
+| [`bridge.py`](bridge.py) | ~1010 рядків | Локальний HTTP, каталог, перевірка ціни, TLS до OpenCode, SSE, необов'язковий пул виходів |
 | [`extension.mjs`](extension.mjs) | ~150 рядків | Реєструє `opencode-zen-free` і `opencode-go-free`, додає ID сесії, команди |
-| [`tests/`](tests) | 70 + 15 тестів | Логіка, локальний HTTP, контракт API розширень OMP |
-| [`deploy/`](deploy) | 1 юніт | systemd user service для автозапуску |
+| [`tests/`](tests) | 97 + 15 тестів | Логіка, локальний HTTP/CONNECT/TLS, пул, контракт API розширень OMP |
+| [`deploy/`](deploy) | systemd, WARP | Автозапуск; необов'язкові три WARP-вузли зі збереженими реєстраціями |
 
-Стандартна бібліотека Python 3.10+ і API розширень, що вже є в OMP. Більше
-нічого.
+Сам міст потребує лише стандартної бібліотеки Python 3.10+ і API розширень OMP.
+Для необов'язкових WARP-вузлів потрібен Docker; [налаштування пулу](docs/ПОСІБНИК.md#три-вузли-warp-необовязково).
 
 ## Перевірено
 

@@ -1,0 +1,30 @@
+name: omp-warp
+x-warp: &warp
+  build: .
+  image: omp-bridge-warp:local
+  cap_add: [NET_ADMIN]
+  devices: [/dev/net/tun:/dev/net/tun]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: 0
+  restart: unless-stopped
+  logging:
+    options:
+      max-size: 1m
+      max-file: "1"
+services:
+  warp-a:
+    <<: *warp
+    ports: ["127.0.0.1:18090:8888"]
+    volumes: [warp-a:/var/lib/cloudflare-warp]
+  warp-b:
+    <<: *warp
+    ports: ["127.0.0.1:18091:8888"]
+    volumes: [warp-b:/var/lib/cloudflare-warp]
+  warp-c:
+    <<: *warp
+    ports: ["127.0.0.1:18092:8888"]
+    volumes: [warp-c:/var/lib/cloudflare-warp]
+volumes:
+  warp-a:
+  warp-b:
+  warp-c:

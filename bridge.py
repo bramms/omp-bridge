@@ -160,6 +160,46 @@ def request_token() -> str:
         return "msg_" + opencode_id(False)
 
 
+def parse_proxy(value: str) -> tuple[str, int]:
+    """One explicit HTTP CONNECT proxy; no credentials or URL routing."""
+    try:
+        if any(ord(c) <= 32 or ord(c) == 127 for c in value):
+            raise ValueError
+        u = urlsplit(value)
+        if (u.scheme != "http" or not u.hostname or u.port is None
+                or not 1 <= u.port <= 65535 or u.username is not None
+                or u.password is not None or u.path not in {"", "/"}
+                or "?" in value or "#" in value):
+            raise ValueError
+        return u.hostname, u.port
+    except ValueError as exc:
+        raise BridgeError("Proxy must be http://HOST:PORT, without credentials, path, query or fragment.") from exc
+
+
+def configured_proxies(values=None):
+    if values is None:
+        try:
+            values = load_json((STATE / "zen-proxies.json").read_bytes())
+        except FileNotFoundError:
+            values = []
+        except (OSError, ValueError) as exc:
+            raise BridgeError("Cannot read zen-proxies.json. Fix the file before starting; no direct fallback.") from exc
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise BridgeError("zen-proxies.json must contain a JSON array of HTTP proxy URLs.")
+    proxies = tuple(parse_proxy(value) for value in values)
+    if len(proxies) > 3 or len(set(proxies)) != len(proxies):
+        raise BridgeError("Configure at most 3 distinct Zen proxy endpoints.")
+    return proxies
+
+
+def upstream_connection(proxy: tuple[str, int] | None = None):
+    conn = http.client.HTTPSConnection(*(proxy or ("opencode.ai", 443)),
+                                       timeout=120, context=ssl.create_default_context())
+    if proxy:
+        conn.set_tunnel("opencode.ai", 443)
+    return conn
+
+
 def public_get(url: str, timeout: float = 15) -> bytes:
     """Fixed public hosts, TLS verification, no redirects and no credentials."""
     u = urlsplit(url)
@@ -558,13 +598,49 @@ class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, catalog, key, token, compat=False, ua_version="1.19.0", connector=None):
+    def __init__(self, address, catalog, key, token, compat=False, ua_version="1.19.0", connector=None, zen_proxies=()):
         super().__init__(address, Handler)
         self.catalog, self.key, self.token = catalog, key, token
         self.compat, self.ua_version = compat, ua_version
-        self.connector = connector or (lambda: http.client.HTTPSConnection("opencode.ai", timeout=120, context=ssl.create_default_context()))
+        self.connector = connector or upstream_connection
+        self.zen_proxies = tuple(zen_proxies)
+        self.proxy_until = [0.0] * len(self.zen_proxies)
+        self.session_proxies = {}
         self.cooldowns, self.lane_cooldowns, self.blocked = {}, {}, {}
         self.lock = threading.Lock()
+
+    def select_proxy(self, lane: str, session: str):
+        if lane != "zen" or not self.zen_proxies:
+            return None
+        with self.lock:
+            now, count = time.time(), len(self.zen_proxies)
+            home = int.from_bytes(hashlib.sha256(session.encode()).digest()[:8], "big") % count
+            start = self.session_proxies.get(session, home)
+            for offset in range(count):
+                index = (start + offset) % count
+                if self.proxy_until[index] <= now:
+                    # Keep the replacement after recovery; bound memory without a database.
+                    self.session_proxies.pop(session, None)
+                    if len(self.session_proxies) >= 10000:
+                        del self.session_proxies[next(iter(self.session_proxies))]
+                    self.session_proxies[session] = index
+                    return index
+            until = min(self.proxy_until)
+            raise BridgeError(f"All Zen proxies are cooling down. Retry in {math.ceil(until - now)}s. "
+                              f"{quota_reset(until)}. No upstream call was made.",
+                              503, "ZenProxyCooldown")
+
+    def cool_proxy(self, index, seconds: float):
+        if index is not None:
+            with self.lock:
+                self.proxy_until[index] = max(self.proxy_until[index], time.time() + seconds)
+
+    def connect_upstream(self, lane: str, proxy=None):
+        if lane == "zen" and self.zen_proxies:
+            if proxy is None:
+                raise BridgeError("A Zen proxy must be selected before connecting.", 503)
+            return upstream_connection(self.zen_proxies[proxy])
+        return self.connector()
 
     def check_model(self, lane: str, model_id: str, endpoint: str):
         with self.lock:
@@ -587,6 +663,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass  # No request bodies, credentials or URLs in default access logs.
+
+    def end_headers(self):
+        proxy = getattr(self, "zen_proxy_index", None)
+        if proxy is not None:
+            self.send_header("X-OMP-Zen-Proxy", str(proxy + 1))
+        super().end_headers()
 
     def setup(self):
         super().setup()
@@ -630,8 +712,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/health":
                 with self.server.lock:
                     blocked = list(self.server.blocked)
+                    proxies = [{"id": i + 1, "cooldown_seconds": max(0, math.ceil(until - time.time()))}
+                               for i, until in enumerate(self.server.proxy_until)]
                 return self.send_json(200, {"ok": True, "version": VERSION,
-                    "compat_opencode": self.server.compat, "blocked_lanes": blocked})
+                    "compat_opencode": self.server.compat, "zen_proxy": bool(proxies),
+                    "zen_proxies": proxies, "blocked_lanes": blocked})
             if self.path == "/catalog":
                 return self.send_json(200, self.server.catalog.get())
             for lane in BASES:
@@ -649,6 +734,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         started, conn, finished = False, None, threading.Event()
+        proxy = None
+        upstream_io = False
         response = None
         endpoint = "chat/completions"
         try:
@@ -688,7 +775,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 headers["Authorization"] = "Bearer public"
             headers["Accept"] = "text/event-stream"
-            conn = self.server.connector()
+            proxy = self.server.select_proxy(lane, headers["x-opencode-session"])
+            self.zen_proxy_index = proxy
+            upstream_io = True
+            conn = self.server.connect_upstream(lane, proxy)
             upstream_path = BASES[lane] + "/" + endpoint if lane == "go" else ("/inference/anthropic/v1/messages" if endpoint == "messages" else "/inference/openai/v1/" + endpoint)
             conn.request("POST", upstream_path, body=encode(body), headers=headers)
             # Abort upstream when the local client disconnects, including a long thinking pause.
@@ -697,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         readable, _, _ = select.select([self.connection], [], [], 0)
                         if readable and self.connection.recv(1, socket.MSG_PEEK) == b"":
+                            finished.set()
                             sock = getattr(conn, "sock", None)
                             # HTTPConnection can release its socket reference for Connection: close
                             # while HTTPResponse still owns the live buffered socket.
@@ -713,8 +804,7 @@ class Handler(BaseHTTPRequestHandler):
             if response.status != 200:
                 exc, wait = error_info(response.status, response.read(16384), self.server.key)
                 retry = response.getheader("Retry-After", "") if response.status == 429 else ""
-                # The free quota is shared by every model of the lane and upstream names its
-                # reset in Retry-After (midnight UTC), so honor it in full for the whole lane.
+                # Honor the full quota reset, scoped to this exit when a pool is configured.
                 lane_quota = response.status == 429 and exc.code == "FreeUsageLimitError"
                 if lane_quota:
                     wait = max(wait, int(retry)) if retry.isdigit() else wait
@@ -726,13 +816,16 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.lock:
                     if response.status in {401, 402, 403}:
                         self.server.blocked[lane] = response.status
-                    if lane_quota:
+                    if proxy is None and lane_quota:
                         self.server.lane_cooldowns[lane] = time.time() + wait
-                    elif wait:
+                    elif proxy is None and wait:
                         self.server.cooldowns[(lane, model_id)] = time.time() + wait
+                if response.status == 429 or 500 <= response.status <= 599:
+                    self.server.cool_proxy(proxy, wait or 30)
                 raise exc
             if "text/event-stream" not in response.getheader("Content-Type", "").lower():
                 raise BridgeError("Expected SSE but received a non-stream response.", 502, "UnexpectedResponse")
+            upstream_io = False
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -742,6 +835,7 @@ class Handler(BaseHTTPRequestHandler):
             started = True
             guard = StreamGuard(endpoint, missing)
             terminal = False
+            upstream_io = True
             for frame, data in sse_events(response):
                 if data == b"[DONE]":
                     terminal = True
@@ -749,13 +843,19 @@ class Handler(BaseHTTPRequestHandler):
                     event = load_json(data)
                     guard.inspect(event)
                     terminal = terminal or is_terminal(event, endpoint)
+                upstream_io = False
                 self.wfile.write(frame)
                 self.wfile.flush()
+                upstream_io = True
             if not terminal:
                 raise BridgeError("Upstream stream ended without a terminal event. Do not treat this as a completed answer.", 502, "TruncatedStream")
         except BridgeError as exc:
+            if not finished.is_set() and exc.code in {"TruncatedStream", "UnexpectedResponse"}:
+                self.server.cool_proxy(proxy, 30)
             self.fail(exc, endpoint, started)
         except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException) as exc:
+            if upstream_io and not finished.is_set():
+                self.server.cool_proxy(proxy, 30)
             self.fail(BridgeError("Transport/stream failure (" + type(exc).__name__ + "). No automatic upstream retry.",
                                   502, "BridgeTransportError"), endpoint, started)
         finally:
@@ -840,6 +940,8 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--compat-opencode", action="store_true", help="Explicitly enable unofficial PR-style OpenCode identity and tool padding; account-policy risk")
     serve.add_argument("--opencode-version", default="1.19.0", help="OpenCode client UA version")
+    serve.add_argument("--zen-proxy", action="append", metavar="http://HOST:PORT",
+                       help="Override saved zen-proxies.json; repeat for up to 3 Zen HTTP CONNECT exits; no POST retries or direct fallback")
     sub.add_parser("doctor", help="Check local proxy health; does not infer")
     smoke = sub.add_parser("probe", help="Opt-in live check: accepts only a real completed model answer as success")
     pick = smoke.add_mutually_exclusive_group(required=True)
@@ -873,14 +975,16 @@ def main(argv=None):
         return probe(rows)
     if not 1 <= args.port <= 65535 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.opencode_version):
         raise BridgeError("Invalid port or OpenCode version.")
+    zen_proxies = configured_proxies(args.zen_proxy)
     key, token = key_from_user(required=False), token_from_user()
     catalog = Catalog()
     snapshot = catalog.get()
     if not snapshot["models"]:
         raise BridgeError("No verified zero-cost models. Inspect catalog; no inference allowed.", 503)
-    server = BridgeServer(("127.0.0.1", args.port), catalog, key, token, args.compat_opencode, args.opencode_version)
+    server = BridgeServer(("127.0.0.1", args.port), catalog, key, token, args.compat_opencode, args.opencode_version, zen_proxies=zen_proxies)
     save_private(STATE / "runtime.json", encode({"port": args.port, "version": VERSION, "pid": os.getpid()}))
     print(f"OMP free-only bridge: 127.0.0.1:{args.port}; {len(snapshot['models'])} verified zero-cost routes.", flush=True)
+    print(f"Zen routing: {len(zen_proxies)} configured proxies." if zen_proxies else "Zen routing: direct.", flush=True)
     print("No OpenCode CLI. No inference retries. No paid fallback. Ctrl+C stops the proxy.", flush=True)
     if args.compat_opencode:
         print("UNOFFICIAL COMPATIBILITY ENABLED: OpenCode-shaped identity and guarded tool padding. Account-policy risk; read docs/ДОСЛІДЖЕННЯ.md.", flush=True)
