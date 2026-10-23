@@ -1,5 +1,5 @@
 FROM ubuntu:22.04
-ARG WARP_VERSION=2026.8.2110.0
+ARG WARP_VERSION=2026.8.2115.0
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg dbus iptables iproute2 tinyproxy \
     && curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg \
