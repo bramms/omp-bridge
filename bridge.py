@@ -34,8 +34,8 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "1.8.2"
-MAX_ZEN_PROXIES = 8
+VERSION = "1.9.0"
+MAX_ZEN_PROXIES = 10
 STATE = Path(os.environ.get("OMP_FREE_HOME", "~/.config/omp-free-bridge")).expanduser()
 CORE = ("bash", "edit", "glob", "grep", "read", "write")
 GO_CORE = ("bash", "edit", "glob", "grep", "read")
@@ -680,6 +680,7 @@ class BridgeServer(ThreadingHTTPServer):
         self.zen_route_quotas = {}
         self.zen_route_ips = {}
         self.zen_route_revisions = {}
+        self.zen_last_429 = {}
         self.cooldowns, self.lane_cooldowns, self.blocked = {}, {}, {}
         self.lock = threading.Lock()
         self.direct_transport_until = 0.0
@@ -804,10 +805,12 @@ class BridgeServer(ThreadingHTTPServer):
                 transport = {}
                 direct_transport = 0.0
                 ips = {}
+                last_429 = {}
             elif data.get("schema") == 2:
                 quotas, transport = data["quotas"], data["transport"]
                 direct_transport = data.get("direct_transport_until", 0.0)
                 ips = data.get("ips", {})
+                last_429 = data.get("last_429", {})
             else:
                 raise ValueError
             if (not isinstance(quotas, dict) or not isinstance(transport, dict)
@@ -819,10 +822,24 @@ class BridgeServer(ThreadingHTTPServer):
                 raise ValueError
             for ip in ips.values():
                 ipaddress.ip_address(ip)
+            if not isinstance(last_429, dict):
+                raise ValueError
+            for route, record in last_429.items():
+                if (not isinstance(route, str) or not isinstance(record, dict)
+                        or type(record.get("received_at")) not in (int, float)
+                        or not math.isfinite(record["received_at"]) or record["received_at"] < 0
+                        or (record.get("retry_after") is not None and not isinstance(record["retry_after"], str))
+                        or (record.get("code") is not None and not isinstance(record["code"], str))
+                        or type(record.get("cooldown_applied")) is not bool):
+                    raise ValueError
+                until = record.get("cooldown_until")
+                if until is not None and (type(until) not in (int, float) or not math.isfinite(until) or until < 0):
+                    raise ValueError
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise BridgeError("Invalid zen-cooldowns.json; refusing to discard known quota cooldowns.") from exc
         self.zen_route_quotas = quotas
         self.zen_route_ips = ips
+        self.zen_last_429 = last_429
         self.direct_transport_until = direct_transport
         self.proxy_until = [transport.get(f"{host}:{port}", 0.0) for host, port in self.zen_proxies]
 
@@ -832,9 +849,33 @@ class BridgeServer(ThreadingHTTPServer):
             save_private(self.cooldown_path, encode({"schema": 2,
                 "quotas": self.zen_route_quotas,
                 "ips": self.zen_route_ips,
+                "last_429": self.zen_last_429,
                 "direct_transport_until": self.direct_transport_until,
                 "transport": {f"{host}:{port}": until
                             for (host, port), until in zip(self.zen_proxies, self.proxy_until)}}))
+
+    def record_zen_429(self, route, received_at, retry_after):
+        # Record the actual response even if reading its body fails or its old IP
+        # revision can no longer put the route on pause. Caller supplies no body.
+        with self.lock:
+            previous = self.zen_last_429.get(route)
+            if previous and previous["received_at"] > received_at:
+                return
+            self.zen_last_429[route] = {"received_at": received_at, "retry_after": retry_after,
+                                       "code": None, "cooldown_applied": False, "cooldown_until": None}
+            self.save_zen_cooldowns()
+
+    def route_cooldown_info(self, route, transport, now):
+        # Caller holds lock; history and deadlines must come from one snapshot.
+        quota = self.zen_route_quotas.get(route, 0)
+        until = max(quota, transport)
+        return {"cooldown_seconds": max(0, math.ceil(until - now)),
+                "quota_cooldown_seconds": max(0, math.ceil(quota - now)),
+                "transport_cooldown_seconds": max(0, math.ceil(transport - now)),
+                "cooldown_until": until if until > now else None,
+                "quota_cooldown_until": quota or None,
+                "transport_cooldown_until": transport or None,
+                "last_429": copy.deepcopy(self.zen_last_429.get(route))}
 
     def route_key(self, proxy):
         return "direct" if proxy is None else "{}:{}".format(*self.zen_proxies[proxy])
@@ -948,16 +989,10 @@ class Handler(BaseHTTPRequestHandler):
                     now = time.time()
                     proxies = []
                     for i, until in enumerate(self.server.proxy_until):
-                        quota = self.server.zen_route_quotas.get(self.server.route_key(i), 0)
-                        proxies.append({"id": i + 1, "endpoint": self.server.route_key(i),
-                                        "cooldown_seconds": max(0, math.ceil(max(until, quota) - now)),
-                                        "quota_cooldown_seconds": max(0, math.ceil(quota - now)),
-                                        "transport_cooldown_seconds": max(0, math.ceil(until - now))})
-                    quota = self.server.zen_route_quotas.get("direct", 0)
-                    transport = self.server.direct_transport_until
-                    direct = {"cooldown_seconds": max(0, math.ceil(max(quota, transport) - now)),
-                              "quota_cooldown_seconds": max(0, math.ceil(quota - now)),
-                              "transport_cooldown_seconds": max(0, math.ceil(transport - now))}
+                        route = self.server.route_key(i)
+                        proxies.append({"id": i + 1, "endpoint": route,
+                                        **self.server.route_cooldown_info(route, until, now)})
+                    direct = self.server.route_cooldown_info("direct", self.server.direct_transport_until, now)
                     addresses = copy.deepcopy(self.server.ip_observations)
                     groups = {}
                     for name, observed in addresses.items():
@@ -1071,8 +1106,11 @@ class Handler(BaseHTTPRequestHandler):
                 conn = self.server.connect_upstream(lane, proxy)
                 conn.request("POST", upstream_path, body=wire_body, headers=headers)
                 response = conn.getresponse()
+                received_at = time.time()
                 if lane == "zen" and response.status == 429:
                     self.server.stats.record(self.server.route_key(proxy), "inference", "http_429")
+                    self.server.record_zen_429(self.server.route_key(proxy), received_at,
+                                               response.getheader("Retry-After"))
                 if response.status == 200:
                     break
                 exc, wait = error_info(response.status, response.read(16384), self.server.key)
@@ -1091,9 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.blocked[lane] = response.status
                     if lane == "zen" and response.status == 429:
                         route = self.server.route_key(proxy)
-                        if revision == self.server.zen_route_revisions.get(route, 0):
+                        applied = revision == self.server.zen_route_revisions.get(route, 0)
+                        if applied:
                             self.server.zen_route_quotas[route] = max(self.server.zen_route_quotas.get(route, 0), time.time() + wait)
-                            self.server.save_zen_cooldowns()
+                        record = self.server.zen_last_429.get(route)
+                        if record and record["received_at"] == received_at:
+                            record.update(code=exc.code, cooldown_applied=applied,
+                                          cooldown_until=self.server.zen_route_quotas[route] if applied else None)
+                        self.server.save_zen_cooldowns()
                     elif lane_quota:
                         self.server.lane_cooldowns[lane] = max(self.server.lane_cooldowns.get(lane, 0), time.time() + wait)
                     elif proxy is None and wait:
@@ -1277,7 +1320,7 @@ def doctor_memory(health):
         for container in containers:
             name = container["Name"].lstrip("/")
             labels = container.get("Config", {}).get("Labels") or {}
-            if not re.fullmatch(r"warp-[a-h]", labels.get("com.docker.compose.service", "")):
+            if not re.fullmatch(r"warp-[a-j]", labels.get("com.docker.compose.service", "")):
                 continue
             bindings = (container.get("NetworkSettings", {}).get("Ports") or {}).get("8888/tcp") or []
             endpoints = []
@@ -1358,7 +1401,19 @@ def doctor_report(health, memory=None):
             return f"{hours}г {minutes:02}хв"
         return f"{minutes}хв" if minutes else f"{seconds}с"
 
-    model_rows, ip_rows = [], []
+    def timestamp(value):
+        if value is None:
+            return "н/д"
+        try:
+            return datetime.fromtimestamp(value).astimezone().isoformat(sep=" ", timespec="seconds")
+        except (ValueError, TypeError, OverflowError, OSError):
+            return "н/д"
+
+    def printable(value):
+        # Retry-After/error codes come from upstream; never emit terminal controls.
+        return "".join(char if char.isprintable() else "?" for char in str(value))[:120]
+
+    model_rows, ip_rows, pause_rows = [], [], []
     model_totals, ip_totals = [0] * 4, [0] * 3
     missing = False
     observations = health.get("ip_observations") or {}
@@ -1390,6 +1445,25 @@ def doctor_report(health, memory=None):
         model_rows.append([label, *inference, ram, running, status])
         observed = observations.get(endpoint) or {}
         ip_rows.append([label, *checks, observed.get("ip") or "—"])
+        last = state.get("last_429")
+        last_at = timestamp(last.get("received_at")) if last else "н/д"
+        retry = "н/д" if last is None else ("немає" if last.get("retry_after") is None
+                                             else printable(last["retry_after"]) or '""')
+        paused = max(quota, transport) > 0
+        end = timestamp(state.get("cooldown_until")) if paused else "—"
+        if quota > 0 and quota >= transport:
+            if (last and last.get("cooldown_applied")
+                    and last.get("cooldown_until") == state.get("quota_cooldown_until")):
+                reason = "429 " + printable(last.get("code") or "тип н/д")
+            else:
+                reason = "Квота; історія 429 н/д"
+        elif transport > 0:
+            reason = "Транспортна помилка"
+        else:
+            reason = "Без паузи"
+        if "zen" in (health.get("blocked_lanes") or []):
+            reason = "Канал зупинено"
+        pause_rows.append([label, last_at, retry, end, reason])
     ram_total = f"{sum(measured) / 1024 ** 2:.1f}" if measured else "н/д"
     if measured and len(measured) < len(entries) - 1:
         ram_total += "+"
@@ -1398,7 +1472,9 @@ def doctor_report(health, memory=None):
     lines.extend(["", "Модельні запити",
                   doctor_table(["Маршрут", "Спроби", "Успіхи", "429", "Транспортні помилки", "RAM, МіБ", "Час роботи", "Стан"], model_rows, (1, 2, 3, 4, 5)),
                   "", "Перевірки IP",
-                  doctor_table(["Маршрут", "Спроби", "Успіхи", "Помилки", "Останній IP"], ip_rows, (1, 2, 3))])
+                  doctor_table(["Маршрут", "Спроби", "Успіхи", "Помилки", "Останній IP"], ip_rows, (1, 2, 3)),
+                  "", "Паузи маршрутів",
+                  doctor_table(["Маршрут", "Остання 429", "Retry-After", "Кінець паузи", "Причина / стан"], pause_rows)])
     for label, endpoint, _ in entries:
         if (observations.get(endpoint) or {}).get("error"):
             lines.append(f"Помилка перевірки IP {label}: {observations[endpoint]['error']}")
@@ -1414,6 +1490,9 @@ def doctor_report(health, memory=None):
     if memory.get("error"):
         lines.append("Пам'ять WARP / час роботи: " + memory["error"])
     lines.extend(["", "Лічильники накопичувальні; локальні відмови через cooldown не є спробами.",
+                  "Остання 429 — історія відповідей через цей брідж; н/д — дані не збережені, зокрема для старих пауз.",
+                  "Retry-After — отриманий заголовок (число означає секунди); немає — заголовок відсутній.",
+                  "Час 429 і кінець чинної паузи містять дату, секунди й UTC-зсув; — означає відсутність чинної паузи.",
                   "Без паузи — немає відомої відмови; доступність квоти тут не перевіряється.",
                   "RAM — поточне споживання контейнера WARP із проксі, без спільних витрат Colima.",
                   "Час роботи — від останнього запуску контейнера; після його перезапуску відлік починається заново.",

@@ -44,6 +44,14 @@ services:
     <<: *warp
     ports: ["127.0.0.1:18097:8888"]
     volumes: [warp-h:/var/lib/cloudflare-warp]
+  warp-i:
+    <<: *warp
+    ports: ["127.0.0.1:18098:8888"]
+    volumes: [warp-i:/var/lib/cloudflare-warp]
+  warp-j:
+    <<: *warp
+    ports: ["127.0.0.1:18099:8888"]
+    volumes: [warp-j:/var/lib/cloudflare-warp]
 volumes:
   warp-a:
   warp-b:
@@ -53,3 +61,5 @@ volumes:
   warp-f:
   warp-g:
   warp-h:
+  warp-i:
+  warp-j:

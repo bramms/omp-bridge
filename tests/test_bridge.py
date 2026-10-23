@@ -56,6 +56,28 @@ def real_tools(endpoint='chat/completions'):
 
 
 class CoreTests(unittest.TestCase):
+    def test_old_cooldowns_keep_deadlines_without_inventing_429_history(self):
+        for data in ({'schema': 1, 'direct_until': 1792800000, 'proxies': {'a:80': 1792800010}},
+                     {'schema': 2, 'quotas': {'direct': 1792800000, 'a:80': 1792800010}, 'transport': {}}):
+            with self.subTest(schema=data['schema']), tempfile.TemporaryDirectory() as root:
+                b.save_private(Path(root) / 'zen-cooldowns.json', b.encode(data))
+                with b.BridgeServer(('127.0.0.1', 0), StaticCatalog(), '', 'L' * 40,
+                                   zen_proxies=(('a', 80),), state=root) as server:
+                    self.assertEqual(server.zen_last_429, {})
+                    self.assertEqual(server.zen_route_quotas, {'direct': 1792800000, 'a:80': 1792800010})
+
+    def test_invalid_saved_429_history_is_rejected(self):
+        record = {'received_at': 1792770000, 'retry_after': '19000', 'code': 'FreeUsageLimitError',
+                  'cooldown_applied': True, 'cooldown_until': 1792789000}
+        for history in ([], {'direct': None}, {'direct': dict(record, received_at=True)},
+                        {'direct': dict(record, retry_after=19000)}, {'direct': dict(record, code=123)},
+                        {'direct': dict(record, cooldown_applied=1)}, {'direct': dict(record, cooldown_until=-1)}):
+            with self.subTest(history=history), tempfile.TemporaryDirectory() as root:
+                b.save_private(Path(root) / 'zen-cooldowns.json', b.encode({
+                    'schema': 2, 'quotas': {}, 'transport': {}, 'last_429': history}))
+                with self.assertRaises(b.BridgeError):
+                    b.BridgeServer(('127.0.0.1', 0), StaticCatalog(), '', 'L' * 40, state=root)
+
     def test_invalid_saved_cooldown_ip_binding_is_rejected(self):
         for ips in ([], {'a:80': 'invalid'}, {'a:80': 123}):
             with self.subTest(ips=ips), tempfile.TemporaryDirectory() as root:
@@ -168,6 +190,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(b.parse_proxy('http://proxy.local:8080/'), ('proxy.local', 8080))
         self.assertEqual(b.parse_proxy('http://[::1]:40000'), ('::1', 40000))
 
+    def test_doctor_memory_includes_ninth_and_tenth_container(self):
+        health = {'zen_proxies': [{'id': i, 'endpoint': f'127.0.0.1:{18089+i}'} for i in (9, 10)]}
+        containers = [{'Name': f'/node-{name}', 'Config': {'Labels': {'com.docker.compose.service': f'warp-{name}'}},
+                       'State': {'Running': True, 'StartedAt': '2026-10-23T12:00:00Z'},
+                       'NetworkSettings': {'Ports': {'8888/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(port)}]}}}
+                      for name, port in [('i', 18098), ('j', 18099)]]
+        values = [SimpleNamespace(stdout='aaaaaaaaaaaa\nbbbbbbbbbbbb\n'),
+                  SimpleNamespace(stdout=json.dumps(containers)),
+                  SimpleNamespace(stdout='\n'.join(json.dumps({'Name': f'node-{name}', 'MemUsage': '75MiB / 8GiB'})
+                                                  for name in ('i', 'j')))]
+        with patch.object(b.subprocess, 'run', side_effect=values):
+            memory = b.doctor_memory(health)
+        self.assertEqual(memory['routes'], {'127.0.0.1:18098': 75 * 1024 ** 2, '127.0.0.1:18099': 75 * 1024 ** 2})
+        self.assertEqual(set(memory['uptime_seconds']), set(memory['routes']))
+
     def test_invalid_proxy_is_rejected_before_credentials_or_network(self):
         invalid = ['', '127.0.0.1:80', 'https://proxy:80', 'socks5://proxy:80',
                    'http://proxy', 'http://proxy:0', 'http://proxy:65536', 'http://proxy:abc',
@@ -181,8 +218,8 @@ class CoreTests(unittest.TestCase):
             key.assert_not_called()
             catalog.assert_not_called()
 
-    def test_duplicate_or_nine_proxy_endpoints_are_rejected_before_network(self):
-        for ports in ([18090, 18090], list(range(18090, 18099))):
+    def test_duplicate_or_eleven_proxy_endpoints_are_rejected_before_network(self):
+        for ports in ([18090, 18090], list(range(18090, 18101))):
             args = ['serve']
             for port in ports:
                 args += ['--zen-proxy', f'http://127.0.0.1:{port}']
@@ -192,15 +229,15 @@ class CoreTests(unittest.TestCase):
                 key.assert_not_called()
                 catalog.assert_not_called()
 
-    def test_serve_cli_passes_all_eight_proxies(self):
+    def test_serve_cli_passes_all_ten_proxies(self):
         args = ['serve']
-        for port in range(18090, 18098):
+        for port in range(18090, 18100):
             args += ['--zen-proxy', f'http://127.0.0.1:{port}']
         with patch.object(b, 'BridgeServer') as server, patch.object(b, 'Catalog', return_value=StaticCatalog()), \
              patch.object(b, 'key_from_user', return_value=''), patch.object(b, 'token_from_user', return_value='L' * 40), \
              patch.object(b, 'save_private'), patch('builtins.print'):
             self.assertEqual(b.main(args), 0)
-            self.assertEqual(server.call_args.kwargs['zen_proxies'], tuple(('127.0.0.1', p) for p in range(18090, 18098)))
+            self.assertEqual(server.call_args.kwargs['zen_proxies'], tuple(('127.0.0.1', p) for p in range(18090, 18100)))
 
     def test_serve_loads_saved_pool_and_cli_can_override_it(self):
         with tempfile.TemporaryDirectory() as root, patch.object(b, 'STATE', Path(root)), \
@@ -224,7 +261,7 @@ class CoreTests(unittest.TestCase):
     def test_bad_saved_pool_is_rejected_before_credentials_or_network(self):
         invalid = ['{', 'null', '{}', '"http://proxy:80"', '[false]',
                    '["https://proxy:80"]', '["http://proxy:80", "http://proxy:80"]',
-                   json.dumps([f'http://{c}:80' for c in 'abcdefghi'])]
+                   json.dumps([f'http://{c}:80' for c in 'abcdefghijk'])]
         with tempfile.TemporaryDirectory() as root, patch.object(b, 'STATE', Path(root)), \
              patch.object(b, 'key_from_user') as key, patch.object(b, 'Catalog') as catalog:
             for raw in invalid:
@@ -796,6 +833,8 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn('a:80', self.server.zen_route_quotas)
         self.server.cool_proxy(0, 30, revision=0)
         self.assertEqual(self.server.proxy_until[0], 0)
+        self.assertFalse(self.server.zen_last_429['a:80']['cooldown_applied'])
+        self.assertEqual(self.server.zen_last_429['a:80']['code'], 'FreeUsageLimitError')
 
     def test_changed_warp_reenters_automatic_quota_failover_in_configured_order(self):
         self.set_proxies(*((f'warp-{i}', 80) for i in range(8)))
@@ -896,7 +935,111 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(next(line for line in ip_table.splitlines() if line.startswith('direct')).split()[1:4],
                          ['3', '0', '0'])
         for label in ('direct', *(f'WARP {i}' for i in range(1, 9))):
-            self.assertEqual(sum(line.startswith(label + ' ') for line in text.splitlines()), 2)
+            self.assertEqual(sum(line.startswith(label + ' ') for line in text.splitlines()), 3)
+
+    def test_429_details_survive_restart_and_pool_reordering_for_every_route(self):
+        proxies = tuple((f'warp-{i}', 80) for i in range(10))
+        self.set_proxies(*proxies, direct_available=True)
+        raw = b'{"error":{"type":"FreeUsageLimitError"}}'
+        self.response = FakeResponse(raw, 429, {'Retry-After': '19184'})
+        def exhausted(proxy):
+            self.response = FakeResponse(raw, 429, {'Retry-After': str(19200 + proxies.index(proxy))})
+            return self.server.connector()
+        with tempfile.TemporaryDirectory() as root:
+            self.server.cooldown_path = Path(root) / 'zen-cooldowns.json'
+            before = time.time()
+            with patch.object(b, 'upstream_connection', side_effect=exhausted):
+                self.assertEqual(self.request()[0], 503)
+            after = time.time()
+            health = self.get('/health')[1]
+            states = [health['zen_direct'], *health['zen_proxies']]
+            for i, state in enumerate(states):
+                last = state['last_429']
+                self.assertLessEqual(before, last['received_at'])
+                self.assertLessEqual(last['received_at'], after)
+                self.assertEqual(last['retry_after'], '19184' if i == 0 else str(19199 + i))
+                self.assertEqual(last['code'], 'FreeUsageLimitError')
+                self.assertTrue(last['cooldown_applied'])
+                self.assertEqual(last['cooldown_until'], state['cooldown_until'])
+                self.assertEqual(state['cooldown_until'], state['quota_cooldown_until'])
+                self.assertAlmostEqual(last['cooldown_until'] - last['received_at'], int(last['retry_after']), delta=1)
+            history = copy.deepcopy(self.server.zen_last_429)
+            with b.BridgeServer(('127.0.0.1', 0), StaticCatalog(), '', 'L' * 40,
+                                zen_proxies=tuple(reversed(proxies)), state=root) as restored:
+                self.assertEqual(restored.zen_last_429, history)
+                self.assertEqual(restored.zen_route_quotas, self.server.zen_route_quotas)
+                self.assertEqual(restored.route_cooldown_info('warp-0:80', 0, after)['last_429'], history['warp-0:80'])
+            self.server.cooldown_path = None
+
+    def test_429_details_preserve_raw_header_and_actual_bounded_deadline(self):
+        for header, code, delay in [(None, 'FreeUsageLimitError', 60), ('', 'FreeUsageLimitError', 60),
+                                    ('invalid', 'FreeUsageLimitError', 60), ('1', 'FreeUsageLimitError', 60),
+                                    ('19000', 'RateLimitError', 3600)]:
+            with self.subTest(header=header, code=code):
+                self.server.zen_route_quotas.clear()
+                self.response = FakeResponse(b.encode({'error': {'type': code}}), 429,
+                                             {'Content-Type': 'application/json', **({'Retry-After': header} if header is not None else {})})
+                self.assertEqual(self.request()[0], 429)
+                state = self.get('/health')[1]['zen_direct']
+                self.assertEqual(state['last_429']['retry_after'], header)
+                self.assertEqual(state['last_429']['code'], code)
+                self.assertAlmostEqual(state['cooldown_until'] - state['last_429']['received_at'], delay, delta=1)
+
+    def test_received_429_is_remembered_even_if_its_body_cannot_be_read(self):
+        class BrokenResponse(FakeResponse):
+            def read(self, *args): raise OSError('connection lost after HTTP headers')
+        self.response = BrokenResponse(b'', 429, {'Retry-After': '19000'})
+        self.assertEqual(self.request()[0], 502)
+        state = self.get('/health')[1]['zen_direct']
+        self.assertEqual(state['last_429']['retry_after'], '19000')
+        self.assertIsNone(state['last_429']['code'])
+        self.assertFalse(state['last_429']['cooldown_applied'])
+        self.assertEqual(state['quota_cooldown_seconds'], 0)
+        self.assertGreater(state['transport_cooldown_seconds'], 0)
+
+    def test_ip_change_preserves_last_429_history_but_clears_its_active_deadline(self):
+        self.set_proxies(('a', 80))
+        values = {None: b'ip=192.0.2.1\nwarp=off\n', ('a', 80): b'ip=2001:db8::1\nwarp=on\n'}
+        with self.trace_responses(values): self.server.refresh_zen_ips()
+        def exhausted(proxy):
+            self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError"}}', 429, {'Retry-After': '19000'})
+            return self.server.connector()
+        with patch.object(b, 'upstream_connection', side_effect=exhausted):
+            self.assertEqual(self.request()[0], 503)
+        last = copy.deepcopy(self.server.zen_last_429['a:80'])
+        values[('a', 80)] = b'ip=2001:db8::2\nwarp=on\n'
+        with self.trace_responses(values): self.server.refresh_zen_ips()
+        state = self.get('/health')[1]['zen_proxies'][0]
+        self.assertEqual(state['last_429'], last)
+        self.assertIsNone(state['cooldown_until'])
+        self.assertIsNone(state['quota_cooldown_until'])
+        self.assertEqual(state['cooldown_seconds'], 0)
+
+    def test_doctor_pause_table_distinguishes_known_old_and_transport_pauses(self):
+        now = time.time()
+        until = now + 19184
+        last = {'received_at': now, 'retry_after': '19184', 'code': 'FreeUsageLimitError',
+                'cooldown_applied': True, 'cooldown_until': until}
+        health = {'zen_direct': {'quota_cooldown_seconds': 19184, 'cooldown_until': until,
+                                 'quota_cooldown_until': until, 'last_429': last},
+                  'zen_proxies': [{'id': 1, 'endpoint': 'a:80', 'quota_cooldown_seconds': 19184, 'cooldown_until': until},
+                                  {'id': 2, 'endpoint': 'b:80', 'transport_cooldown_seconds': 30, 'cooldown_until': now + 30},
+                                  {'id': 3, 'endpoint': 'c:80', 'last_429': last}]}
+        text = b.doctor_report(health)
+        table = text.partition('Паузи маршрутів')[2]
+        direct = next(line for line in table.splitlines() if line.startswith('direct '))
+        self.assertIn(b.datetime.fromtimestamp(now).astimezone().isoformat(sep=' ', timespec='seconds'), direct)
+        self.assertIn(b.datetime.fromtimestamp(until).astimezone().isoformat(sep=' ', timespec='seconds'), direct)
+        self.assertIn('19184', direct)
+        self.assertIn('429 FreeUsageLimitError', direct)
+        self.assertIn('Квота; історія 429 н/д', next(line for line in table.splitlines() if line.startswith('WARP 1 ')))
+        self.assertIn('Транспортна помилка', next(line for line in table.splitlines() if line.startswith('WARP 2 ')))
+        cleared = next(line for line in table.splitlines() if line.startswith('WARP 3 '))
+        self.assertIn('Без паузи', cleared)
+        self.assertNotIn(b.datetime.fromtimestamp(until).astimezone().isoformat(sep=' ', timespec='seconds'), cleared)
+        last['retry_after'] = 'bad\n\x1b[31m'
+        last['code'] = 'bad\t\x1b[31m'
+        self.assertNotIn('\x1b', b.doctor_report(health))
 
     def test_doctor_json_preserves_the_full_health_snapshot_beyond_16_kib(self):
         health = self.get('/health')[1]
@@ -1053,8 +1196,8 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(set(self.server.zen_route_quotas), {'direct'})
             self.assertFalse(any(self.server.proxy_until))
 
-    def test_direct_and_all_eight_warp_quotas_exhaust_once_in_configured_order(self):
-        proxies = tuple((f'warp-{i}', 80) for i in range(8))
+    def test_direct_and_all_ten_warp_quotas_exhaust_once_in_configured_order(self):
+        proxies = tuple((f'warp-{i}', 80) for i in range(10))
         self.set_proxies(*proxies, direct_available=True)
         self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError"}}', 429,
                                      {'Retry-After': '19184'})
@@ -1067,14 +1210,14 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(status, 503)
             self.assertIn(b'ZenProxyCooldown', raw)
             self.assertEqual([call.args[0] for call in connect.call_args_list], list(proxies))
-            self.assertEqual(len(self.calls), 9)
+            self.assertEqual(len(self.calls), 11)
             self.assertEqual(len({call['wire_body'] for call in self.calls}), 1)
             self.assertEqual(self.request()[0], 503)
-            self.assertEqual(connect.call_count, 8)
-            self.assertEqual(len(self.calls), 9)
+            self.assertEqual(connect.call_count, 10)
+            self.assertEqual(len(self.calls), 11)
             health = self.get('/health')[1]
             self.assertGreater(health['zen_direct']['quota_cooldown_seconds'], 19000)
-            self.assertEqual(sum(p['quota_cooldown_seconds'] > 19000 for p in health['zen_proxies']), 8)
+            self.assertEqual(sum(p['quota_cooldown_seconds'] > 19000 for p in health['zen_proxies']), 10)
             self.assertNotIn('zen', self.server.lane_cooldowns)
 
     def test_one_warp_quota_immediately_uses_the_next_healthy_route(self):
@@ -1346,9 +1489,9 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(len(nodes[second][0].posts), 1)
             self.assertFalse(self.calls)
 
-    def test_direct_then_eight_real_connect_exits_keep_request_and_session_during_quota_failover(self):
+    def test_direct_then_ten_real_connect_exits_keep_request_and_session_during_quota_failover(self):
         with contextlib.ExitStack() as stack:
-            nodes = [stack.enter_context(connect_proxy()) for _ in range(8)]
+            nodes = [stack.enter_context(connect_proxy()) for _ in range(10)]
             self.set_proxies(*(proxy.server_address for proxy, _ in nodes), direct_available=True)
             stack.enter_context(patch.object(b.ssl, 'create_default_context', return_value=nodes[0][1]))
             self.response = FakeResponse(b'{"error":{"type":"FreeUsageLimitError"}}', 429, {'Retry-After': '19184'})
@@ -1358,16 +1501,16 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn(b'BRIDGE_OK', raw)
             self.assertIn(b'[DONE]', raw)
-            self.assertEqual(headers['X-OMP-Zen-Proxy'], '8')
-            self.assertEqual([len(proxy.posts) for proxy, _ in nodes], [1] * 8)
+            self.assertEqual(headers['X-OMP-Zen-Proxy'], '10')
+            self.assertEqual([len(proxy.posts) for proxy, _ in nodes], [1] * 10)
             self.assertEqual(len(self.calls), 1)
             for proxy, _ in nodes:
                 _, headers, body = proxy.posts[0]
                 self.assertEqual(body, self.calls[0]['body'])
                 self.assertEqual(headers['x-opencode-session'], self.calls[0]['headers']['x-opencode-session'])
-            self.assertEqual(len(self.server.zen_route_quotas), 8)
+            self.assertEqual(len(self.server.zen_route_quotas), 10)
             self.assertEqual(self.request()[0], 200)
-            self.assertEqual([len(proxy.posts) for proxy, _ in nodes], [1] * 7 + [2])
+            self.assertEqual([len(proxy.posts) for proxy, _ in nodes], [1] * 9 + [2])
             self.assertEqual(len(self.calls), 1)
 
     def test_pre_stream_error_uses_the_endpoint_error_shape(self):
