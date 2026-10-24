@@ -159,14 +159,16 @@ RAM і час роботи читаються локально з Docker лиш�
 по черзі. Перезапуск перериває активні з'єднання відповідних вузлів, тому
 спочатку дочекайтеся завершення запитів через них.
 
-Команди для macOS із Colima з каталогу репозиторію:
+Команди для macOS із Colima можна запускати з будь-якого каталогу.
+Нижче репозиторій розташований у `~/Projects/omp-bridge`; якщо ви зберегли його
+в іншому місці, замініть шлях до `compose.yaml` на свій.
 
 ```sh
 # Лише WARP 3 і 4
-docker --context colima compose -f deploy/warp/compose.yaml restart warp-c warp-d
+docker --context colima compose -f "$HOME/Projects/omp-bridge/deploy/warp/compose.yaml" restart warp-c warp-d
 
 # Усі десять WARP
-docker --context colima compose -f deploy/warp/compose.yaml restart
+docker --context colima compose -f "$HOME/Projects/omp-bridge/deploy/warp/compose.yaml" restart
 ```
 
 `warp-a`…`warp-j` відповідають WARP 1…10. Для одного вузла вкажіть лише його
