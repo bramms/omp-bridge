@@ -235,7 +235,7 @@ class CoreTests(unittest.TestCase):
             args += ['--zen-proxy', f'http://127.0.0.1:{port}']
         with patch.object(b, 'BridgeServer') as server, patch.object(b, 'Catalog', return_value=StaticCatalog()), \
              patch.object(b, 'key_from_user', return_value=''), patch.object(b, 'token_from_user', return_value='L' * 40), \
-             patch.object(b, 'save_private'), patch('builtins.print'):
+             patch.object(b, 'save_private'), patch.object(b, 'opencode_version', return_value='2.2.6'), patch('builtins.print'):
             self.assertEqual(b.main(args), 0)
             self.assertEqual(server.call_args.kwargs['zen_proxies'], tuple(('127.0.0.1', p) for p in range(18090, 18100)))
 
@@ -243,7 +243,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(b, 'STATE', Path(root)), \
              patch.object(b, 'BridgeServer') as server, patch.object(b, 'Catalog', return_value=StaticCatalog()), \
              patch.object(b, 'key_from_user', return_value=''), patch.object(b, 'token_from_user', return_value='L' * 40), \
-             patch.object(b, 'save_private'), patch('builtins.print'):
+             patch.object(b, 'save_private'), patch.object(b, 'opencode_version', return_value='2.2.6'), patch('builtins.print'):
             config = Path(root) / 'zen-proxies.json'
             config.write_text(json.dumps([f'http://127.0.0.1:{p}' for p in range(18090, 18098)]))
             self.assertEqual(b.main(['serve']), 0)
@@ -422,23 +422,23 @@ class CoreTests(unittest.TestCase):
     def test_malformed_anthropic_version_is_refused(self):
         with self.assertRaisesRegex(b.BridgeError, 'anthropic-version'):
             b.prepare({'_omp_free_session': 'x', 'stream': True}, 'messages',
-                      {'anthropic-version': '2023-06-01\r\n x-injected: 1'}, False, '1.18.31')
+                      {'anthropic-version': '2023-06-01\r\n x-injected: 1'}, False, '2.2.6')
 
     def test_synchronous_inference_rejected(self):
         with self.assertRaisesRegex(b.BridgeError, 'stream:true'):
-            b.prepare({'_omp_free_session': 'x'}, 'responses', {}, True, '1.18.31')
+            b.prepare({'_omp_free_session': 'x'}, 'responses', {}, True, '2.2.6')
 
     def test_missing_session_rejected(self):
         with self.assertRaisesRegex(b.BridgeError, 'session'):
-            b.prepare({'stream': True}, 'responses', {}, True, '1.18.31')
+            b.prepare({'stream': True}, 'responses', {}, True, '2.2.6')
 
     def test_extension_helper_header_fallback(self):
-        body, headers, missing = b.prepare({'stream': True, '_omp_free_bridge': True}, 'responses', {'x-omp-free-session': 'helper'}, True, '1.18.31')
+        body, headers, missing = b.prepare({'stream': True, '_omp_free_bridge': True}, 'responses', {'x-omp-free-session': 'helper'}, True, '2.2.6')
         self.assertEqual(headers['x-opencode-session'], b.session_token('helper'))
         self.assertNotIn('_omp_free_bridge', body)
 
     def test_compat_disabled_does_not_impersonate_or_pad(self):
-        body, headers, missing = b.prepare({'stream': True, '_omp_free_session': 's'}, 'responses', {}, False, '1.18.31')
+        body, headers, missing = b.prepare({'stream': True, '_omp_free_session': 's'}, 'responses', {}, False, '2.2.6')
         self.assertTrue(headers['User-Agent'].startswith('omp-free-bridge/'))
         self.assertNotIn('tools', body)
         self.assertFalse(missing)
@@ -446,13 +446,13 @@ class CoreTests(unittest.TestCase):
     def test_toolless_all_three_protocols(self):
         for endpoint in ['chat/completions', 'responses', 'messages']:
             with self.subTest(endpoint=endpoint):
-                body, h, missing = b.prepare({'stream': True, '_omp_free_session': 's'}, endpoint, {}, True, '1.18.31')
+                body, h, missing = b.prepare({'stream': True, '_omp_free_session': 's'}, endpoint, {}, True, '2.2.6')
                 declared = {(t.get('function') or {}).get('name') if endpoint == 'chat/completions' else t.get('name')
                             for t in body['tools']}
                 self.assertEqual(declared, set(b.CORE))
                 self.assertEqual(missing, set(b.CORE))
                 self.assertNotIn('tool_choice', body)
-                self.assertEqual(h['User-Agent'], 'opencode/1.18.31')
+                self.assertEqual(h['User-Agent'], 'opencode/latest/2.2.6/cli')
                 self.assertEqual(h['x-session-affinity'], h['x-opencode-session'])
                 self.assertEqual(h['x-opencode-session-id'], h['x-opencode-session'])
                 self.assertNotIn('x-opencode-request', h)
@@ -461,7 +461,7 @@ class CoreTests(unittest.TestCase):
 
     def test_go_keeps_its_own_five_tool_and_auth_contract(self):
         body, h, missing = b.prepare({'stream': True, '_omp_free_session': 's'},
-                                      'chat/completions', {}, True, '1.18.31', 'go')
+                                      'chat/completions', {}, True, '2.2.6', 'go')
         self.assertEqual(missing, set(b.GO_CORE))
         self.assertEqual(body['tool_choice'], 'none')
         self.assertNotIn('x-session-affinity', h)
@@ -479,23 +479,24 @@ class CoreTests(unittest.TestCase):
                     'messages': [{'role': 'assistant', 'reasoning_content': 'preserved',
                         'tool_calls': [{'id': 'call_1', 'type': 'function', 'function': {'name': 'edit', 'arguments': '{"anchor":"12:AB","text":"й"}'}}]}]}
         saved = copy.deepcopy(original)
-        body, _, missing = b.prepare(original, 'chat/completions', {}, True, '1.18.31')
+        body, _, missing = b.prepare(original, 'chat/completions', {}, True, '2.2.6')
         self.assertEqual(body['tools'], saved['tools'])
-        self.assertEqual(body['messages'], saved['messages'])
+        self.assertEqual(body['messages'][1:], saved['messages'])
+        self.assertEqual(body['messages'][0]['role'], 'system')
         self.assertEqual(original, saved)
         self.assertFalse(missing)
         self.assertEqual(body['tool_choice'], 'auto')
 
     def test_partial_tools_pad_only_missing(self):
         original = real_tools()[0:1]
-        body, _, missing = b.prepare({'stream': True, 'tools': original, '_omp_free_session': 's'}, 'chat/completions', {}, True, '1.18.31')
-        self.assertEqual(len(body['tools']), 6)
+        body, _, missing = b.prepare({'stream': True, 'tools': original, '_omp_free_session': 's'}, 'chat/completions', {}, True, '2.2.6')
+        self.assertEqual(len(body['tools']), len(b.CORE))
         self.assertEqual(body['tools'][0], original[0])
-        self.assertNotIn('bash', missing)
+        self.assertNotIn('edit', missing)
         self.assertNotIn('tool_choice', body)
 
     def test_non_function_native_tool_not_disabled(self):
-        body, _, _ = b.prepare({'stream': True, 'tools': [{'type': 'web_search'}], '_omp_free_session': 's'}, 'responses', {}, True, '1.18.31')
+        body, _, _ = b.prepare({'stream': True, 'tools': [{'type': 'web_search'}], '_omp_free_session': 's'}, 'responses', {}, True, '2.2.6')
         self.assertNotIn('tool_choice', body)
         self.assertEqual(body['tools'][0], {'type': 'web_search'})
 
@@ -584,7 +585,7 @@ class CoreTests(unittest.TestCase):
     def test_catalog_full_refresh_from_mock_sources(self):
         with tempfile.TemporaryDirectory() as root:
             def fake(url):
-                if url.endswith('/zen/v1/models'): return b.encode(listing()['zen'])
+                if url.endswith('/inference/v1/models'): return b.encode(listing()['zen'])
                 if url.endswith('/zen/go/v1/models'): return b.encode({'data': []})
                 if url.endswith('/api.json'): return b.encode(metadata())
                 return b'<html></html>'
@@ -1032,7 +1033,7 @@ class HTTPTests(unittest.TestCase):
         self.assertIn(b.datetime.fromtimestamp(until).astimezone().isoformat(sep=' ', timespec='seconds'), direct)
         self.assertIn('19184', direct)
         self.assertIn('429 FreeUsageLimitError', direct)
-        self.assertIn('Квота; історія 429 н/д', next(line for line in table.splitlines() if line.startswith('WARP 1 ')))
+        self.assertIn('Відмова; історія 429 н/д', next(line for line in table.splitlines() if line.startswith('WARP 1 ')))
         self.assertIn('Транспортна помилка', next(line for line in table.splitlines() if line.startswith('WARP 2 ')))
         cleared = next(line for line in table.splitlines() if line.startswith('WARP 3 '))
         self.assertIn('Без паузи', cleared)
@@ -1737,11 +1738,11 @@ class HTTPTests(unittest.TestCase):
                                      429, {'Retry-After': '19184'})
         status, raw = self.request()
         self.assertEqual(status, 429)
-        self.assertIn(b'Resets at', raw)
+        self.assertIn(b'Retry-After deadline', raw)
         status, raw = self.request({'model': 'demo-responses', 'stream': True, 'input': 'x', '_omp_free_session': 'x'},
                                    path='/zen/v1/responses')
         self.assertEqual(status, 503)
-        self.assertIn(b'Resets at', raw)
+        self.assertIn(b'Retry-After deadline', raw)
         self.assertIn(b'ZenProxyCooldown', raw)
         self.assertEqual(len(self.calls), 1)
 
@@ -1779,7 +1780,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_sse_stub_call_stopped_before_forward(self):
-        bad = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'name': 'bash', 'arguments': '{}'}}]}}]}
+        bad = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'name': 'shell', 'arguments': '{}'}}]}}]}
         self.response = FakeResponse(frame(bad) + b'data: [DONE]\n\n')
         status, raw = self.request()
         self.assertEqual(status, 200)  # Headers already started; protocol error event follows.

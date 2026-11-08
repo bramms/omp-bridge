@@ -130,7 +130,8 @@ export default async function opencodeFreeNative(pi) {
     if (typeof id !== 'string' || !id) throw new Error('OMP не передав ID сесії.');
     // OMP's documented hook returns the replacement payload directly, NOT {payload}.
     // The proxy removes this private field before forwarding to OpenCode.
-    return { ...event.payload, _omp_free_session: id };
+    return { ...event.payload, _omp_free_session: id,
+      ...(typeof ctx.cwd === 'string' && ctx.cwd ? { _omp_free_directory: ctx.cwd } : {}) };
   });
 
   pi.registerCommand('free-models', {

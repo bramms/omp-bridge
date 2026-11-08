@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OMP OpenCode free-only bridge. Python 3.10+, standard library only.
+"""OMP OpenCode free-only bridge. Python 3.10+ stdlib, qualified Bun for Zen.
 No OpenCode CLI, key rotation or paid fallback. Inference never runs subprocesses;
 the local doctor command can query Docker for container memory and uptime.
 Zen starts direct, then tries fixed WARP exits in order after a quota refusal.
@@ -24,6 +24,7 @@ from pathlib import Path
 import re
 import secrets
 import select
+import signal
 import socket
 import ssl
 import subprocess
@@ -34,10 +35,15 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "1.9.0"
+from zen_transport import BunTransport
+
+VERSION = "1.10.0"
+OPENCODE_VERSION = "2.2.6"
 MAX_ZEN_PROXIES = 10
 STATE = Path(os.environ.get("OMP_FREE_HOME", "~/.config/omp-free-bridge")).expanduser()
-CORE = ("bash", "edit", "glob", "grep", "read", "write")
+CORE = ("edit", "glob", "grep", "read", "shell")
+CORE_PARAMETERS = {"edit": "path", "glob": "pattern", "grep": "pattern", "read": "path", "shell": "command"}
+SESSION_TRACES: dict[str, str] = {}
 GO_CORE = ("bash", "edit", "glob", "grep", "read")
 SESSION_RE = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}\Z")
 ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -397,7 +403,8 @@ class Catalog:
         listings, docs, notes = {}, {}, []
         for lane in BASES:
             try:
-                listings[lane] = load_json(self.fetch("https://opencode.ai" + BASES[lane] + "/models"))
+                listing_url = "https://opencode.ai/inference/v1/models" if lane == "zen" else "https://opencode.ai" + BASES[lane] + "/models"
+                listings[lane] = load_json(self.fetch(listing_url))
             except Exception:
                 # Do not keep stale models from an unavailable lane.
                 notes.append(lane + ": listing unavailable; lane disabled")
@@ -430,23 +437,124 @@ class Catalog:
         return copy.deepcopy(fresh)
 
 
+def opencode_version(value="auto", fetch=None) -> str:
+    """Read the official CLI release, not the legacy opencode-ai v1 package.
+
+    Only v2 is qualified. An unavailable/new-major registry keeps the last
+    qualified release; it never changes the wire contract to an untested major.
+    """
+    if value != "auto":
+        if not re.fullmatch(r"2\.[0-9]+\.[0-9]+", value):
+            raise BridgeError("Zen compatibility requires an OpenCode 2.x.y release.")
+        return value
+    try:
+        if fetch is None:
+            conn = http.client.HTTPSConnection("registry.npmjs.org", timeout=5, context=ssl.create_default_context())
+            try:
+                conn.request("GET", "/@opencode%2fcli/latest", headers={"Accept": "application/json"})
+                response = conn.getresponse()
+                if response.status != 200:
+                    return OPENCODE_VERSION
+                raw = response.read(MAX_FRAME + 1)
+            finally:
+                conn.close()
+        else:
+            raw = fetch()
+        if len(raw) > MAX_FRAME:
+            return OPENCODE_VERSION
+        data = load_json(raw)
+        version = data.get("version") if isinstance(data, dict) else None
+        if data.get("name") == "@opencode/cli" and isinstance(version, str) and re.fullmatch(r"2\.[0-9]+\.[0-9]+", version):
+            return version
+    except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException):
+        pass
+    return OPENCODE_VERSION
+
+
+def text_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content
+                         if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return ""
+
+
+def zen_environment(body: dict, endpoint: str, directory=None) -> str:
+    """Append factual environment metadata; preserve the caller's instructions.
+
+    No prompt from an unrelated coding harness is injected, and no instruction
+    grants filesystem access. Tool execution remains entirely with the caller.
+    """
+    messages = body.get("messages" if endpoint != "responses" else "input", [])
+    system = [m for m in messages if isinstance(m, dict) and m.get("role") in {"system", "developer"}] if isinstance(messages, list) else []
+    texts = [text_content(m.get("content")) for m in system]
+    texts.append(text_content(body.get("system" if endpoint == "messages" else "instructions")))
+    if directory is None:
+        for text in texts:
+            match = re.search(r"(?:<cwd>\s*|Working directory: *)(/[^\n<>]+)", text)
+            if match:
+                directory = match[1].strip()
+                break
+    directory = str(Path.cwd()) if directory is None else directory
+    if (not isinstance(directory, str) or not directory or len(directory) > 4096
+            or any(ord(c) < 32 or c in "<>" for c in directory)
+            or not (directory.startswith("/") or re.match(r"[A-Za-z]:[\\/]", directory))):
+        raise BridgeError("A workspace directory must be an absolute path without control characters.")
+    if any(re.search(r"<env>\r?\n  Working directory: [^\n]+\n[\s\S]*?</env>", text) for text in texts):
+        return directory
+    block = ("Here is some useful information about the environment you are running in:\n"
+             f"<env>\n  Working directory: {directory}\n  Workspace root folder: {directory}\n"
+             f"  Platform: {sys.platform}\n</env>")
+    def append(content):
+        if isinstance(content, list):
+            return [*content, {"type": "text", "text": block}]
+        return (content + "\n\n" if isinstance(content, str) and content else "") + block
+    if endpoint in {"messages", "responses"}:
+        key = "system" if endpoint == "messages" else "instructions"
+        body[key] = append(body.get(key))
+    else:
+        first = next((m for m in system if m.get("role") == "system"), None)
+        if first is not None:
+            first["content"] = append(first.get("content"))
+        else:
+            body.setdefault("messages", []).insert(0, {"role": "system", "content": block})
+    return directory
+
+
+def zen_trace(session: str) -> dict:
+    with ID_LOCK:
+        if session not in SESSION_TRACES:
+            if len(SESSION_TRACES) >= 10_000:
+                SESSION_TRACES.pop(next(iter(SESSION_TRACES)))
+            SESSION_TRACES[session] = secrets.token_hex(16)
+        trace = SESSION_TRACES[session]
+    span = secrets.token_hex(8)
+    return {"b3": f"{trace}-{span}-1-{secrets.token_hex(8)}", "traceparent": f"00-{trace}-{span}-01"}
+
+
 def prepare(payload: dict, endpoint: str, headers: dict, compat: bool, ua_version: str, lane: str = "zen") -> tuple[dict, dict, set]:
     body = copy.deepcopy(payload)
     identity = body.pop("_omp_free_session", None)
     body.pop("_omp_free_bridge", None)
+    directory = body.pop("_omp_free_directory", None)
     identity = identity or headers.get("session_id") or headers.get("x-opencode-session") or headers.get("x-claude-code-session-id") or body.get("prompt_cache_key") or headers.get("x-omp-free-session")
     if not isinstance(identity, str) or not identity or len(identity) > 4096:
         raise BridgeError("Missing stable OMP session ID. Load extension.mjs; do not invent one per request.")
     session = session_token(identity)
-    outbound = {"User-Agent": ("opencode/" + ua_version if compat else "omp-free-bridge/" + VERSION),
+    outbound = {"User-Agent": ("opencode/" + (ua_version if lane == "zen" else "1.19.0") if compat else "omp-free-bridge/" + VERSION),
                 "x-opencode-session": session, "Content-Type": "application/json",
                 "Accept-Encoding": "identity"}
     if compat and lane == "zen":
+        directory = zen_environment(body, endpoint, directory)
         outbound.update({
+            "User-Agent": f"opencode/latest/{ua_version}/cli",
+            **zen_trace(session),
             "x-opencode-client": "cli",
-            "x-opencode-project": hashlib.sha1(b"git-remote:github.com/anomalyco/opencode").hexdigest(),
+            "x-opencode-project": hashlib.sha1(("directory:" + directory).encode()).hexdigest(),
             "x-opencode-session-id": session,
             "x-session-affinity": session,
+            "x-session-id": session,
         })
     if endpoint == "messages":
         version = headers.get("anthropic-version", "2023-06-01")
@@ -480,7 +588,10 @@ def prepare(payload: dict, endpoint: str, headers: dict, compat: bool, ua_versio
         for name in core:
             if name not in missing:
                 continue
-            schema = {"type": "object", "properties": {"unused": {"type": "string"}}, "additionalProperties": False}
+            parameter = CORE_PARAMETERS[name] if lane == "zen" else "unused"
+            schema = {"type": "object", "properties": {parameter: {"type": "string"}}, "additionalProperties": False}
+            if lane == "zen":
+                schema["required"] = [parameter]
             stub = {"name": name, "description": "Unavailable in this call. Do not invoke this tool."}
             if endpoint == "messages":
                 stub["input_schema"] = schema
@@ -586,7 +697,7 @@ def error_info(status: int, raw: bytes, key: str) -> tuple[BridgeError, float]:
     wait = 0
     if status == 429:
         wait = 60
-        text += " [Quota/rate limit; NOT a successful model answer.]"
+        text += " [Free-tier refusal: quota OR client policy; NOT a successful model answer.]"
     if status in {401, 402, 403}:
         text += " [No retry, key rotation, balance fallback or paid-model substitution. Restart only after resolving the cause.]"
     return BridgeError(text, status, code), wait
@@ -595,7 +706,7 @@ def error_info(status: int, raw: bytes, key: str) -> tuple[BridgeError, float]:
 def quota_reset(until: float, now: float | None = None) -> str:
     left = max(0, int(until - (time.time() if now is None else now)))
     stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(round(until)))
-    return f"Resets at {stamp} (in {left // 3600}h {left % 3600 // 60}m)"
+    return f"Retry-After deadline {stamp} (in {left // 3600}h {left % 3600 // 60}m); availability after it is not guaranteed"
 
 
 LANE_NAMES = {"zen": "OpenCode Zen", "go": "OpenCode Go"}
@@ -670,11 +781,14 @@ class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, catalog, key, token, compat=False, ua_version="1.19.0", connector=None, zen_proxies=(), state=None):
+    def __init__(self, address, catalog, key, token, compat=False, ua_version=OPENCODE_VERSION, connector=None, zen_proxies=(), state=None, zen_connector=None):
         super().__init__(address, Handler)
         self.catalog, self.key, self.token = catalog, key, token
         self.compat, self.ua_version = compat, ua_version
         self.connector = connector or upstream_connection
+        self.zen_connector = zen_connector
+        self.zen_client_profile = "opencode2-bun" if zen_connector else "python"
+        self.zen_profile_quotas = {}
         self.zen_proxies = tuple(zen_proxies)
         self.proxy_until = [0.0] * len(self.zen_proxies)
         self.zen_route_quotas = {}
@@ -837,7 +951,20 @@ class BridgeServer(ThreadingHTTPServer):
                     raise ValueError
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise BridgeError("Invalid zen-cooldowns.json; refusing to discard known quota cooldowns.") from exc
-        self.zen_route_quotas = quotas
+        # 429 is also a client-policy denial. Keep the old client's pauses as
+        # history, but do not prevent the newly qualified network stack from
+        # being tried once. Subsequent 429s belong to this profile and retain
+        # their full Retry-After across restarts. No upstream quota is reset.
+        profiles = data.get("profile_quotas", {})
+        previous = data.get("client_profile", "python")
+        if (not isinstance(previous, str) or previous not in {"python", "opencode2-bun"} or not isinstance(profiles, dict)
+                or any(name not in {"python", "opencode2-bun"} or not isinstance(values, dict)
+                       or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                              for value in values.values()) for name, values in profiles.items())):
+            raise BridgeError("Invalid client-profile cooldown history.")
+        profiles[previous] = quotas
+        self.zen_profile_quotas = profiles
+        self.zen_route_quotas = profiles.get(self.zen_client_profile, {})
         self.zen_route_ips = ips
         self.zen_last_429 = last_429
         self.direct_transport_until = direct_transport
@@ -847,6 +974,8 @@ class BridgeServer(ThreadingHTTPServer):
         # Caller holds lock. Persist by endpoint, so adding/reordering slots keeps known limits.
         if self.cooldown_path is not None:
             save_private(self.cooldown_path, encode({"schema": 2,
+                "client_profile": self.zen_client_profile,
+                "profile_quotas": {**self.zen_profile_quotas, self.zen_client_profile: self.zen_route_quotas},
                 "quotas": self.zen_route_quotas,
                 "ips": self.zen_route_ips,
                 "last_429": self.zen_last_429,
@@ -910,6 +1039,8 @@ class BridgeServer(ThreadingHTTPServer):
                 self.save_zen_cooldowns()
 
     def connect_upstream(self, lane: str, proxy=None):
+        if lane == "zen" and self.zen_connector is not None:
+            return self.zen_connector(self.zen_proxies[proxy] if proxy is not None else None)
         if lane == "zen" and proxy is not None:
             return upstream_connection(self.zen_proxies[proxy])
         return self.connector()
@@ -1001,7 +1132,8 @@ class Handler(BaseHTTPRequestHandler):
                     duplicates = {ip: names for ip, names in groups.items() if len(names) > 1}
                     monitor_error = self.server.ip_monitor_error
                 return self.send_json(200, {"ok": True, "version": VERSION,
-                    "compat_opencode": self.server.compat, "zen_proxy": bool(proxies),
+                    "compat_opencode": self.server.compat, "opencode_version": self.server.ua_version,
+                    "zen_compatibility": "v2", "zen_client_profile": self.server.zen_client_profile, "zen_transport": "bun" if self.server.zen_connector else "python", "zen_proxy": bool(proxies),
                     "zen_routing": "direct-first", "zen_quota_failover": bool(proxies),
                     "zen_route_order": ["direct", *(f"warp-{i + 1}" for i in range(len(proxies)))],
                     "zen_direct": direct,
@@ -1265,7 +1397,7 @@ def probe(rows: list[dict]):
                     result = "MODEL_ANSWER_CONFIRMED" if passed else "NO_VERIFIED_ANSWER"
                 else:
                     error = load_json(response.read(16384))
-                    result = "QUOTA_LIMIT_NOT_SUCCESS" if status == 429 else "FAILED"
+                    result = "FREE_TIER_REFUSED_QUOTA_OR_CLIENT" if status == 429 else "FAILED"
                 item = {"lane": row["lane"], "model": row["id"], "http": status, "result": result}
                 if error:
                     item["error"] = error
@@ -1431,7 +1563,7 @@ def doctor_report(health, memory=None):
         if "zen" in (health.get("blocked_lanes") or []):
             status = "Канал зупинено"
         elif max(quota, transport) > 0:
-            status = ("Квота: " if quota >= transport else "Мережа: ") + duration(max(quota, transport))
+            status = ("429: " if quota >= transport else "Мережа: ") + duration(max(quota, transport))
         else:
             status = "Без паузи"
         ram = "—" if endpoint == "direct" else "н/д"
@@ -1456,7 +1588,7 @@ def doctor_report(health, memory=None):
                     and last.get("cooldown_until") == state.get("quota_cooldown_until")):
                 reason = "429 " + printable(last.get("code") or "тип н/д")
             else:
-                reason = "Квота; історія 429 н/д"
+                reason = "Відмова; історія 429 н/д"
         elif transport > 0:
             reason = "Транспортна помилка"
         else:
@@ -1494,6 +1626,7 @@ def doctor_report(health, memory=None):
                   "Retry-After — отриманий заголовок (число означає секунди); немає — заголовок відсутній.",
                   "Час 429 і кінець чинної паузи містять дату, секунди й UTC-зсув; — означає відсутність чинної паузи.",
                   "Без паузи — немає відомої відмови; доступність квоти тут не перевіряється.",
+                  "429 може означати квоту або несумісний клієнт; Retry-After не гарантує відновлення генерації.",
                   "RAM — поточне споживання контейнера WARP із проксі, без спільних витрат Colima.",
                   "Час роботи — від останнього запуску контейнера; після його перезапуску відлік починається заново.",
                   "н/д — немає виміру; + у підсумку — частина вузлів без виміру; direct не має WARP-контейнера."])
@@ -1508,9 +1641,11 @@ def main(argv=None):
     serve = sub.add_parser("serve", help="Run a foreground, loopback-only proxy")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--compat-opencode", action="store_true", help="Explicitly enable unofficial PR-style OpenCode identity and tool padding; account-policy risk")
-    serve.add_argument("--opencode-version", default="1.19.0", help="OpenCode client UA version")
+    serve.add_argument("--opencode-version", default="auto", help="Zen OpenCode 2.x.y version, or auto from the official @opencode/cli release")
     serve.add_argument("--zen-proxy", action="append", metavar="http://HOST:PORT",
                        help=f"Override saved zen-proxies.json; up to {MAX_ZEN_PROXIES} fixed WARP exits, tried in order after direct quota exhaustion")
+    serve.add_argument("--zen-transport", choices=("bun", "python"), default="bun", help="Zen network runtime; Bun matches the qualified OpenCode 2 stack")
+    serve.add_argument("--bun-bin", help="Path to qualified Bun 1.3.14")
     doctor = sub.add_parser("doctor", help="Show human-readable route statistics and health; does not infer")
     doctor.add_argument("--json", action="store_true", help="Print the complete machine-readable /health JSON")
     smoke = sub.add_parser("probe", help="Opt-in live check: accepts only a real completed model answer as success")
@@ -1548,36 +1683,41 @@ def main(argv=None):
             if response.status != 200:
                 raise BridgeError("Proxy catalog unavailable.", 503)
             rows = load_json(response.read(MAX_BODY))["models"]
-        if not args.all:
-            rows = [r for r in rows if r["lane"] == args.lane and r["id"] == args.model]
+        rows = [r for r in rows if r["lane"] == args.lane and (args.all or r["id"] == args.model)]
         if not rows:
             raise BridgeError("No matching approved free models. Run catalog for exclusion reasons.")
         return probe(rows)
-    if not 1 <= args.port <= 65535 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.opencode_version):
+    def stop_service(_signum, _frame):
+        raise KeyboardInterrupt
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop_service)
+    if not 1 <= args.port <= 65535:
         raise BridgeError("Invalid port or OpenCode version.")
     zen_proxies = configured_proxies(args.zen_proxy)
+    args.opencode_version = opencode_version(args.opencode_version)
     key, token = key_from_user(required=False), token_from_user()
     catalog = Catalog()
     snapshot = catalog.get()
     if not snapshot["models"]:
         raise BridgeError("No verified zero-cost models. Inspect catalog; no inference allowed.", 503)
-    server = BridgeServer(("127.0.0.1", args.port), catalog, key, token, args.compat_opencode, args.opencode_version, zen_proxies=zen_proxies, state=STATE)
-    with server.lock:
-        server.save_zen_cooldowns()
-    save_private(STATE / "runtime.json", encode({"port": args.port, "version": VERSION, "pid": os.getpid()}))
-    print(f"OMP free-only bridge: 127.0.0.1:{args.port}; {len(snapshot['models'])} verified zero-cost routes.", flush=True)
-    print(f"Zen routing: direct, then {len(zen_proxies)} fixed WARP proxies in configured order; quota cooldowns are per route." if zen_proxies else "Zen routing: direct.", flush=True)
-    print("No OpenCode CLI. No stream replay. No paid fallback. Ctrl+C stops the proxy.", flush=True)
-    if args.compat_opencode:
-        print("UNOFFICIAL COMPATIBILITY ENABLED: OpenCode-shaped identity and guarded tool padding. Account-policy risk; read docs/ДОСЛІДЖЕННЯ.md.", flush=True)
-    server.start_ip_monitor()
-    try:
-        server.serve_forever(poll_interval=0.25)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.ip_monitor_stop.set()
-        server.server_close()
+    with BunTransport(args.bun_bin, STATE) if args.compat_opencode and args.zen_transport == "bun" else contextlib.nullcontext(None) as transport:
+        server = BridgeServer(("127.0.0.1", args.port), catalog, key, token, args.compat_opencode, args.opencode_version, zen_proxies=zen_proxies, state=STATE, zen_connector=transport.connection if transport else None)
+        with server.lock:
+            server.save_zen_cooldowns()
+        save_private(STATE / "runtime.json", encode({"port": args.port, "version": VERSION, "pid": os.getpid()}))
+        print(f"OMP free-only bridge: 127.0.0.1:{args.port}; {len(snapshot['models'])} verified zero-cost routes.", flush=True)
+        print(f"Zen routing: direct, then {len(zen_proxies)} fixed WARP proxies in configured order; quota cooldowns are per route." if zen_proxies else "Zen routing: direct.", flush=True)
+        print("No OpenCode CLI. No stream replay. No paid fallback. Ctrl+C stops the proxy.", flush=True)
+        if args.compat_opencode:
+            print("UNOFFICIAL COMPATIBILITY ENABLED: OpenCode-shaped identity and guarded tool padding. Account-policy risk; read docs/ДОСЛІДЖЕННЯ.md.", flush=True)
+        server.start_ip_monitor()
+        try:
+            server.serve_forever(poll_interval=0.25)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.ip_monitor_stop.set()
+            server.server_close()
     return 0
 
 
