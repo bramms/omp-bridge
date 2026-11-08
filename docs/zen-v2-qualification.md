@@ -106,3 +106,23 @@ python3 deploy/qualify-zen.py --compare-bun
   silently renamed or dropped. A provider refusal remains visible.
 * A real remaining quota is unknown. 429 and Retry-After are recorded as a
   refusal/deadline, not proof that generation will recover at that deadline.
+
+## Final verification and WARP
+
+At 01:11 Kyiv on November 9, the final candidate passed **152 Python tests** and
+**20 JavaScript tests** on SILENT. DeepSeek, MiMo and GLM again returned
+completed `BRIDGE_OK` directly; the tool round trip returned `BRIDGE_TOOL_OK`.
+Each of these responses reported cost 0.
+
+With the same candidate Bun transport and verified DeepSeek model, one separate
+streaming request was sent through each of the ten existing WARP exits:
+
+| WARP exits | Result |
+|---|---|
+| 2, 4, 5, 8, 10 | HTTP 200, completed BRIDGE_OK, reported cost 0 |
+| 1, 3, 6, 7, 9 | HTTP 429 FreeUsageLimitError; Retry-After was preserved |
+
+The working bridge is configured for the first five WARP exits. Its configuration
+and running service were not changed by these checks. The test transport and
+runtime lived only in the temporary qualification directory. No WARP restart
+or registration change was needed for this result.
