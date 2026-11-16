@@ -22,7 +22,9 @@ from zen_transport import BunTransport
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bun-bin')
+    parser.add_argument('--opencode-version', default=b.OPENCODE_VERSION)
     args = parser.parse_args()
+    version = b.opencode_version(args.opencode_version)
     def interrupted(signum, _):
         raise SystemExit(128 + signum)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -31,11 +33,11 @@ def main():
         root = Path(folder)
         catalog = b.Catalog(state=root / 'catalog')
         snapshot = catalog.get()
-        print(json.dumps({'checked_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        print(json.dumps({'checked_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'opencode_version': version,
                           'catalog': [(r['id'], r['endpoint']) for r in snapshot['models'] if r['lane'] == 'zen']}), flush=True)
         token = secrets.token_urlsafe(32)
         with BunTransport(args.bun_bin, b.STATE) as transport:
-            server = b.BridgeServer(('127.0.0.1', 0), catalog, '', token, True, '2.2.6',
+            server = b.BridgeServer(('127.0.0.1', 0), catalog, '', token, True, version,
                                     state=root / 'bridge', zen_connector=transport.connection)
             worker = threading.Thread(target=server.serve_forever, daemon=True)
             worker.start()

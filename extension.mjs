@@ -34,6 +34,7 @@ export default async function opencodeFreeNative(pi) {
   const base = `http://127.0.0.1:${runtime.port}`;
   // Stable fallback for helper calls that do not run the session payload hook.
   const helperSession = `omp-extension-${randomUUID()}`;
+  const probeHeaders = process.env.OMP_FREE_PROBE === '1' ? { 'x-omp-bridge-probe': 'omp' } : {};
   let catalog;
   const registered = new Set();
 
@@ -89,7 +90,7 @@ export default async function opencodeFreeNative(pi) {
       });
       if (models.length) {
         pi.registerProvider(provider.id, { baseUrl: `${base}/${provider.route}/v1`, apiKey: token,
-          authHeader: true, headers: { 'x-omp-free-session': helperSession }, models });
+          authHeader: true, headers: { 'x-omp-free-session': helperSession, ...probeHeaders }, models });
         registered.add(provider.id);
       } else if (registered.has(provider.id)) {
         pi.unregisterProvider(provider.id);

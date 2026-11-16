@@ -26,9 +26,14 @@ class BunConnection:
             raise ValueError('Zen transport accepts POST only')
         if self.transport.process.poll() is not None:
             raise OSError('Zen Bun transport exited; restart the bridge')
+        proxy_url = None
+        if self.proxy:
+            host, port = self.proxy
+            authority = f'[{host}]' if ':' in host else host
+            proxy_url = f'http://{authority}:{port}'
         value = {'path': path, 'headers': headers,
                  'body': body.decode() if isinstance(body, bytes) else body,
-                 'proxy': f'http://{self.proxy[0]}:{self.proxy[1]}' if self.proxy else None}
+                 'proxy': proxy_url}
         self.inner.request('POST', '/request', json.dumps(value),
                            {'Authorization': 'Bearer ' + self.transport.token, 'Content-Type': 'application/json'})
 

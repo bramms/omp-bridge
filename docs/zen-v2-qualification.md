@@ -91,9 +91,9 @@ python3 deploy/qualify-zen.py --compare-bun
 
 ## State and boundaries
 
-* Old Python 429 deadlines are retained under their client profile. The qualified
-  Bun profile is tried independently once; its new 429s retain the full deadline
-  across restarts. Server-side quotas are not reset or bypassed by state migration.
+* The November 9 build separated 429 deadlines by runtime profile. The
+  current bridge retains the latest 429 for diagnostics only. Its routing
+  discards historical quota deadlines on startup.
 * WARP registrations, proxy pool configuration, account files and the local
   public-facing token are not replaced. The Bun RPC token is ephemeral and is
   never forwarded upstream or printed.
@@ -126,3 +126,68 @@ The working bridge is configured for the first five WARP exits. Its configuratio
 and running service were not changed by these checks. The test transport and
 runtime lived only in the temporary qualification directory. No WARP restart
 or registration change was needed for this result.
+
+## OpenCode 2.3.0, 2026-11-16
+
+The local recorder captured the official 2.3.0 release using the same trace,
+project and four session headers as 2.2.6. Its chat request still used
+`stream_options` and `max_completion_tokens`, and the core tools still used
+`read.path` and `shell.command`. The official binary returned `BRIDGE_OK`
+directly over Zen. With the bridge's existing request shape, the 2.3.0 profile
+and Bun 1.3.14 returned completed streams for DeepSeek, MiMo and GLM at cost
+zero. DeepSeek also completed the two-turn `bridge_echo` check. The new
+`probe --route all` confirmed completed DeepSeek responses at cost zero
+directly and through all ten configured WARP exits. The verified offline
+version fallback is now 2.3.0.
+
+* [OpenCode 2.3.0](https://github.com/anomalyco/opencode/releases/tag/v2.3.0)
+  fixes classification of temporary request limits and preserves completed
+  work when the client resumes a retryable stream. The bridge's retry is
+  limited to errors before SSE begins.
+* [9router](https://github.com/decolua/9router/commit/989b1eecb98f2e378fa8713f4c9b0fe40099e19b)
+  reproduced an overload-specific 429. The bridge recognizes that response
+  separately and allows one repeat with a wait of up to five seconds.
+  `FreeUsageLimitError` can switch routes within the current request. Both forms of
+  [HTTP Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after)
+  are supported.
+* [Magpie](https://github.com/yetone/magpie/issues/3491) and
+  [zen-proxy](https://github.com/12errh/zen-proxy) corroborate the existing v2
+  endpoints and request shape. Zen-proxy's model health checks also verify a
+  real completed model answer. Our per-route probe uses the bridge's installed
+  transport and reports the running service's recorded cooldown separately.
+
+```sh
+python3 deploy/qualify-zen.py --opencode-version 2.3.0
+python3 tests/live_zen.py --opencode-version 2.3.0
+python3 bridge.py probe --model deepseek-v4.1-flash-free --route all
+```
+
+### OMP `edit` compatibility, 2026-11-16
+
+On OMP 18.20.2, a first-turn MiniMax M3.1 Flash Free request at `high` returned
+`FreeUsageLimitError` with the default tools. All runs below used the same
+direct exit and the OpenCode 2.3.0 Bun transport. The header and model were held
+constant when comparing the two `edit` schemas.
+
+| MiniMax request | Zen response |
+|---|---|
+| OMP with `--no-tools` | 200, completed model answer |
+| Same request with the default OMP tool declarations | 429 |
+| Default declarations with the output cap lowered to 1,024 | 429 |
+| Default declarations after mapping the three `edit` fields | 200, completed model answer |
+| Same mapped declaration with any one of the three fields restored to the OMP spelling | 429 |
+
+OMP's `old_string`, `new_string`, and `replace_all` correspond to `oldString`,
+`newString`, and `replaceAll` in [OpenCode 2.3.0's `edit` tool](https://raw.githubusercontent.com/anomalyco/opencode/v2.3.0/packages/core/src/tool/plugin/edit.ts).
+The bridge maps the declaration and prior `edit` calls sent to Zen Chat
+Completions, then restores OMP's argument names on streamed tool calls. An OMP
+run with MiniMax at `high` passed with the default tool set. A separate run
+read a disposable file, successfully edited it, and received the final answer
+after passing the edit result back to MiniMax.
+
+The [9Router DeepSeek report from November 14](https://github.com/decolua/9router/issues/5690)
+reproduced the same error with a different tool declaration. A
+[November 11 MiniMax report](https://github.com/decolua/9router/issues/5600)
+shows the same response text. The OpenCode [free-tier issue thread](https://github.com/anomalyco/opencode/issues/59387)
+also contains reports from official clients. The controlled comparison above
+isolates the declaration that triggered the refusal in this bridge.

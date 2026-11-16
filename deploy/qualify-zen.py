@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -35,13 +36,13 @@ def download(url):
         return response.read(350_000_001)
 
 
-def cli_binary(root, bun=False):
+def cli_binary(root, bun=False, opencode_version=VERSION):
     machine = {'x86_64': 'x64', 'arm64': 'arm64', 'aarch64': 'arm64'}[platform.machine()]
     system = {'Linux': 'linux', 'Darwin': 'darwin'}[platform.system()]
     if bun and machine == 'arm64':
         machine = 'aarch64'
     package = f'@oven/bun-{system}-{machine}' if bun else f'@opencode/cli-{system}-{machine}'
-    version = '1.3.14' if bun else VERSION
+    version = '1.3.14' if bun else opencode_version
     metadata = json.loads(download(f'https://registry.npmjs.org/{package}/{version}'))
     raw = download(metadata['dist']['tarball'])
     digest = 'sha512-' + base64.b64encode(hashlib.sha512(raw).digest()).decode()
@@ -88,7 +89,7 @@ class Recorder(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def compare_bridge(capture, directory, bun=None):
+def compare_bridge(capture, directory, bun=None, opencode_version=VERSION):
     """Same model, exit and minute: native body versus candidate bridge shape."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import bridge
@@ -129,7 +130,7 @@ def compare_bridge(capture, directory, bun=None):
     request = {"model": MODEL, "messages": [{"role": "user", "content": "Reply exactly BRIDGE_OK. Do not call tools."}],
                "stream": True, "stream_options": {"include_usage": True}, "max_tokens": 512,
                "_omp_free_session": "zen-v2-qualification", "_omp_free_directory": directory}
-    body, headers, missing = bridge.prepare(request, "chat/completions", {}, True, VERSION)
+    body, headers, missing = bridge.prepare(request, "chat/completions", {}, True, opencode_version)
     headers.update(Authorization="Bearer public", Accept="*/*")
     probe("candidate-bridge", body, headers, missing)
     variants.append({"label": "candidate-bridge-over-bun", "body": json.loads(json.dumps(body)), "headers": headers})
@@ -174,10 +175,13 @@ for (const variant of variants) {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--opencode-version', default=VERSION, help='Exact official OpenCode 2 release')
     parser.add_argument('--proxy', action='append', default=[], help='Existing HTTP proxy; direct is always tested first')
     parser.add_argument('--compare-bridge', action='store_true', help='Also compare the candidate Python transport with the captured native request')
     parser.add_argument('--compare-bun', action='store_true', help='Also qualify verified Bun 1.3.14 in the temporary directory')
     args = parser.parse_args()
+    if not re.fullmatch(r'2\.[0-9]+\.[0-9]+', args.opencode_version):
+        parser.error('--opencode-version must be an exact 2.x.y release')
     for proxy in args.proxy:
         if not proxy.startswith('http://127.0.0.1:') or not proxy.rsplit(':', 1)[1].isdigit():
             parser.error('Only an existing loopback HTTP proxy is accepted')
@@ -194,8 +198,8 @@ def main():
         thread = threading.Thread(target=recorder.serve_forever, daemon=True)
         thread.start()
         try:
-            binary, digest = cli_binary(root)
-            print(json.dumps({'official_cli': VERSION, 'integrity': digest, 'credential': 'public',
+            binary, digest = cli_binary(root, opencode_version=args.opencode_version)
+            print(json.dumps({'official_cli': args.opencode_version, 'integrity': digest, 'credential': 'public',
                               'existing_accounts': False, 'permissions': 'ask; closed stdin'}), flush=True)
             (root / 'tmp').mkdir()
             base_env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'LANG': 'C.UTF-8',
@@ -245,7 +249,7 @@ def main():
                             'system_messages': sum(m.get('role') == 'system' for m in body.get('messages', []))}}), flush=True)
             if (args.compare_bridge or args.compare_bun) and recorder.captures:
                 bun = cli_binary(root, bun=True)[0] if args.compare_bun else None
-                compare_bridge(recorder.captures[0], folder, bun)
+                compare_bridge(recorder.captures[0], folder, bun, args.opencode_version)
         finally:
             for child in children:
                 terminate(child)

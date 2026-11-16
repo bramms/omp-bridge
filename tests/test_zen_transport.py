@@ -34,6 +34,15 @@ class BunTransportTests(unittest.TestCase):
             process.poll.return_value = 1
             with self.assertRaises(OSError): conn.request('POST', '/', b'{}', headers)
 
+    def test_serializes_ipv6_proxy_authority(self):
+        transport = SimpleNamespace(port=12345, token='RPC_TOKEN', process=Mock())
+        transport.process.poll.return_value = None
+        with patch('zen_transport.http.client.HTTPConnection') as connection:
+            conn = BunConnection(transport, ('::1', 18090))
+            conn.request('POST', '/inference/openai/v1/chat/completions', b'{}', {})
+        rpc = json.loads(connection.return_value.request.call_args.args[2])
+        self.assertEqual(rpc['proxy'], 'http://[::1]:18090')
+
     def test_process_is_started_once_token_uses_stdin_and_credentials_do_not_enter_environment(self):
         with tempfile.TemporaryDirectory() as state:
             process = Mock(pid=123456)

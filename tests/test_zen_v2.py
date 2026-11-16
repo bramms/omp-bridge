@@ -101,22 +101,20 @@ class ZenV2Tests(unittest.TestCase):
             self.assertEqual(server.connect_upstream('go'), 'original')
             self.assertEqual(calls, [None, ('127.0.0.1', 18090)])
 
-    def test_runtime_migration_preserves_both_profiles_and_does_not_reset_new_refusals(self):
+    def test_runtime_migration_ignores_quota_deadlines_from_both_profiles(self):
         with tempfile.TemporaryDirectory() as folder:
             state = Path(folder)
-            b.save_private(state / 'zen-cooldowns.json', b.encode({
-                'schema': 2, 'quotas': {'direct': 2000000000}, 'transport': {}}))
-            with b.BridgeServer(('127.0.0.1', 0), None, '', 'L' * 40, state=state,
-                                zen_connector=lambda proxy: None) as server:
-                self.assertEqual(server.zen_route_quotas, {})
-                self.assertEqual(server.zen_profile_quotas['python'], {'direct': 2000000000})
-                server.zen_route_quotas['direct'] = 2000000010
-                server.save_zen_cooldowns()
-            with b.BridgeServer(('127.0.0.1', 0), None, '', 'L' * 40, state=state,
-                                zen_connector=lambda proxy: None) as server:
-                self.assertEqual(server.zen_route_quotas, {'direct': 2000000010})
-            with b.BridgeServer(('127.0.0.1', 0), None, '', 'L' * 40, state=state) as server:
-                self.assertEqual(server.zen_route_quotas, {'direct': 2000000000})
+            path = state / 'zen-cooldowns.json'
+            raw = {'schema': 2, 'client_profile': 'opencode2-bun',
+                   'quotas': {'direct': 2000000000}, 'transport': {},
+                   'profile_quotas': {'python': {'direct': 2000000010}, 'opencode2-bun': {'direct': 2000000000}}}
+            for connector in (None, lambda proxy: None):
+                b.save_private(path, b.encode(raw))
+                with b.BridgeServer(('127.0.0.1', 0), None, '', 'L' * 40, state=state,
+                                    zen_connector=connector) as server:
+                    self.assertIsNone(server.select_proxy('zen', 'existing-session'))
+                    server.save_zen_cooldowns()
+                    self.assertEqual(b.load_json(path.read_bytes())['quotas'], {})
 
     def test_version_uses_official_v2_package_and_fails_closed_to_qualified_release(self):
         fetch = lambda: b.encode({'name': '@opencode/cli', 'version': '2.2.7'})
