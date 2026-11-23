@@ -92,6 +92,12 @@ omp -e ~/.local/share/omp-free-bridge/extension.mjs --model opencode-zen-free/bi
 Прямий маршрут завжди перший. Якщо `zen-proxies.json` уже налаштований,
 той самий `serve` використовує його після вичерпання квоти direct або мережевого збою.
 
+## Gemini 4 Neon (опційно)
+
+`gemini-app/gemini-neon` використовує окремий локальний `gemini-app2api` і квоту
+Gemini App підключеного Google-акаунта. Підключення, перевірка акаунта й тест
+інструментів описані в [гайді Gemini Neon](docs/gemini-neon.md).
+
 ## Запуск із пулом WARP
 
 Спочатку один раз підніміть десять вузлів та створіть їхні реєстрації за

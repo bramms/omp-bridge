@@ -1,0 +1,25 @@
+name: omp-gemini-neon
+
+services:
+  gateway:
+    image: ghcr.io/shawtim/gemini-app2api:1.7.1
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18989:18989"
+      - "127.0.0.1:18765:18765"
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_CALLBACK_HOST: "0.0.0.0"
+      GATEWAY_ALLOW_REMOTE: "1"
+      GATEWAY_PUBLIC_ORIGIN: http://127.0.0.1:18989
+      GATEWAY_ADMIN_PASSWORD: ${GATEWAY_ADMIN_PASSWORD:?Set GATEWAY_ADMIN_PASSWORD in a private env file}
+    volumes:
+      - gateway-state:/data
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+
+volumes:
+  gateway-state:
