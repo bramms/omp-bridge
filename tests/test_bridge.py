@@ -1081,6 +1081,44 @@ class HTTPTests(unittest.TestCase):
                          [('127.0.0.1:18090', 'probe', 200, 'completed'), ('direct', 'probe', 429, 'http_error')])
         self.assertEqual(stats['routes']['direct']['inference']['attempts'], 0)
 
+    def test_restart_429_uses_only_fresh_local_route_results(self):
+        targets = [None, ('127.0.0.1', 18096), ('127.0.0.1', 18092), ('127.0.0.1', 18090), ('remote.test', 18094)]
+        self.set_proxies(*targets[1:], direct_available=True)
+        args = ['probe', '--model', 'demo-chat-completions', '--route', 'all', '--restart-429']
+        cases = [((429, 429, 200, 503, 200), ['7'], 0),
+                 ((429, 200, 200, 503, 200), [], 0),
+                 ((200, 429, 429, 200, 429), ['7', '3'], 1),
+                 ((429, 429, 403, 429, 200), [], None)]
+        for statuses, numbers, expected in cases:
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as root, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                 patch.object(b, 'STATE', Path(root)), patch.object(b.subprocess, 'run') as restart:
+                checked = []
+
+                def connect(proxy):
+                    checked.append(proxy)
+                    status = statuses[targets.index(proxy)]
+                    response = (frame({'choices': [{'delta': {'content': 'BRIDGE_OK'}, 'finish_reason': 'stop'}]})
+                                if status == 200 else b'{"error":{"type":"FreeUsageLimitError"}}')
+                    return SimpleNamespace(request=lambda *args: None, getresponse=lambda: FakeResponse(response, status),
+                                           close=lambda: None)
+
+                b.save_private(b.STATE / 'runtime.json', b.encode({'port': self.server.server_port}))
+                b.save_private(b.STATE / 'local.token', b'L' * 40)
+                restart.return_value.returncode = 0
+                with patch.object(b, 'upstream_connection', side_effect=connect):
+                    if expected is None:
+                        with self.assertRaisesRegex(b.BridgeError, 'до обходу всіх маршрутів'):
+                            b.main(args)
+                    else:
+                        self.assertEqual(b.main(args), expected)
+                if numbers:
+                    restart.assert_called_once_with([str(Path(b.__file__).resolve().parent / 'deploy' / 'restart-warp.sh'),
+                                                     *numbers], check=False)
+                else:
+                    restart.assert_not_called()
+                self.assertEqual(checked, targets if expected is not None else targets[:3])
+
     def test_recent_results_keep_request_and_omp_probe_separate_after_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'zen-stats.json'

@@ -182,19 +182,24 @@ RAM і час роботи читаються локально з Docker лиш�
 спочатку дочекайтеся завершення запитів через них.
 
 Команди для macOS із Colima можна запускати з будь-якого каталогу.
-Нижче репозиторій розташований у `~/Projects/omp-bridge`; якщо ви зберегли його
-в іншому місці, замініть шлях до `compose.yaml` на свій.
+У прикладах репозиторій розташований у `~/Projects/omp-bridge`.
 
 ```sh
-# Лише WARP 3 і 4
-docker --context colima compose -f "$HOME/Projects/omp-bridge/deploy/warp/compose.yaml" restart warp-c warp-d
+# Лише WARP 3 і 7
+"$HOME/Projects/omp-bridge/deploy/restart-warp.sh" 3 7
+
+# Проба DeepSeek на всіх маршрутах і перезапуск локальних WARP з HTTP 429
+"$HOME/Projects/omp-bridge/deploy/restart-warp.sh" --429
 
 # Усі десять WARP
 docker --context colima compose -f "$HOME/Projects/omp-bridge/deploy/warp/compose.yaml" restart
 ```
 
-`warp-a`…`warp-j` відповідають WARP 1…10. Для одного вузла вкажіть лише його
-ім'я. На Linux із поточним Docker engine приберіть `--context colima`.
+Сценарій приймає один або кілька номерів від 1 до 10 зі стандартного пулу.
+На macOS він використовує Colima, на Linux — поточний контекст Docker.
+Режим `--429` викликає `probe --route all` для DeepSeek V4.1 Flash Free й
+вибирає контейнери за адресами з цієї перевірки. Параметр `--model <id>`
+дозволяє перевірити іншу модель Zen.
 
 Це стандартний [Docker Compose restart](https://docs.docker.com/reference/cli/docker/compose/restart/):
 він зберігає volumes реєстрацій та не перезапускає міст, але не чекає готовності

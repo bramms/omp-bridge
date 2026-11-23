@@ -1748,7 +1748,32 @@ def probe(rows: list[dict]):
     return record_probe(results, len(rows))
 
 
-def probe_zen_routes(row, health, route, bun_bin=None):
+def restart_warps_with_429(results, targets):
+    deploy = Path(__file__).resolve().parent / "deploy"
+    bundled = load_json((deploy / "zen-proxies.json").read_bytes())
+    local_numbers = {proxy: str(number) for number, proxy in enumerate(configured_proxies(bundled), 1)}
+    numbers = []
+    skipped = []
+    for item in results:
+        proxy, _ = targets[item["route"]]
+        if item.get("http") != 429 or proxy is None:
+            continue
+        number = local_numbers.get(proxy)
+        if number is None:
+            skipped.append(item["route"])
+        else:
+            numbers.append(number)
+    if skipped:
+        print("HTTP 429 на маршрутах поза локальним пулом WARP — " + ", ".join(skipped), file=sys.stderr)
+    if not numbers:
+        print("Локальних WARP з HTTP 429 у цій перевірці немає.", file=sys.stderr)
+        return int(bool(skipped))
+    print("Перезапуск локальних WARP з HTTP 429 — " + ", ".join(numbers), file=sys.stderr, flush=True)
+    result = subprocess.run([str(deploy / "restart-warp.sh"), *numbers], check=False)
+    return result.returncode or int(bool(skipped))
+
+
+def probe_zen_routes(row, health, route, bun_bin=None, *, restart_429=False):
     if "zen" in health["blocked_lanes"]:
         raise BridgeError("Zen is blocked after an upstream auth, payment or policy denial.", 409, "UpstreamLaneStopped")
     targets = {"direct": (None, health["zen_direct"])}
@@ -1782,7 +1807,12 @@ def probe_zen_routes(row, health, route, bun_bin=None):
             if item.get("http") in {401, 402, 403}:
                 break
     report_probe_outcomes(outcomes)
-    return record_probe(results, len(selected))
+    status = record_probe(results, len(selected))
+    if restart_429:
+        if len(results) != len(selected):
+            raise BridgeError("Перевірка завершилася до обходу всіх маршрутів. Повторіть після усунення помилки доступу.")
+        return restart_warps_with_429(results, selected)
+    return status
 
 
 def doctor_table(headers, rows, numeric=()):
@@ -2095,6 +2125,7 @@ def main(argv=None):
                        help="Zen only: one live request per selected route, with the running bridge's local cooldown shown separately")
     smoke.add_argument("--bun-bin", help="Qualified Bun executable for per-route probes, if installed separately")
     smoke.add_argument("--omp", action="store_true", help="Run real OMP turns, a disposable edit and compaction over the running bridge")
+    smoke.add_argument("--restart-429", action="store_true", help="After --route all, restart local WARP containers that returned HTTP 429")
     args = parser.parse_args(argv)
     if args.command == "login":
         key = getpass.getpass("Zen/Go API key (not a Console st- token): ").strip()
@@ -2123,6 +2154,8 @@ def main(argv=None):
                 print("Перевірка бріджа не вдалася: " + str(detail.get("message", detail)))
             return 0 if response.status == 200 and health.get("ok") else 1
     if args.command == "probe":
+        if args.restart_429 and args.route != "all":
+            smoke.error("--restart-429 requires --route all")
         if args.omp and (args.lane != "zen" or args.all or args.route):
             smoke.error("--omp requires --lane zen and one --model, using normal bridge routing")
         if args.route and (args.lane != "zen" or args.all):
@@ -2150,7 +2183,7 @@ def main(argv=None):
                 if response.status != 200:
                     raise BridgeError("Running bridge health unavailable.", 503)
                 health = load_json(response.read(MAX_FRAME))
-            return probe_zen_routes(rows[0], health, args.route, args.bun_bin)
+            return probe_zen_routes(rows[0], health, args.route, args.bun_bin, restart_429=args.restart_429)
         return probe(rows)
     def stop_service(_signum, _frame):
         raise KeyboardInterrupt
