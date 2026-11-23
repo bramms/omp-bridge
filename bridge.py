@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OMP OpenCode free-only bridge. Python 3.10+, standard library only.
+"""OMP OpenCode free-only bridge. Python 3.10+ stdlib, qualified Bun for Zen.
 No OpenCode CLI, key rotation or paid fallback. Inference never runs subprocesses;
 the local doctor command can query Docker for container memory and uptime.
 Zen starts direct, then tries fixed WARP exits in order after a quota refusal.
@@ -11,7 +11,8 @@ import argparse
 import contextlib
 import concurrent.futures
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import getpass
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ from pathlib import Path
 import re
 import secrets
 import select
+import signal
 import socket
 import ssl
 import subprocess
@@ -34,10 +36,20 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "1.9.0"
+from omp_probe import probe_omp
+from zen_transport import BunTransport
+
+VERSION = "1.10.0"
+OPENCODE_VERSION = "2.3.0"
 MAX_ZEN_PROXIES = 10
+ZEN_OVERLOAD_MAX_WAIT = 5
+CATALOG_STARTUP_RETRY = 15
 STATE = Path(os.environ.get("OMP_FREE_HOME", "~/.config/omp-free-bridge")).expanduser()
-CORE = ("bash", "edit", "glob", "grep", "read", "write")
+CORE = ("edit", "glob", "grep", "read", "shell")
+CORE_PARAMETERS = {"edit": "path", "glob": "pattern", "grep": "pattern", "read": "path", "shell": "command"}
+OMP_EDIT_FIELDS = {"old_string": "oldString", "new_string": "newString", "replace_all": "replaceAll"}
+ZEN_EDIT_FIELDS = {wire: local for local, wire in OMP_EDIT_FIELDS.items()}
+SESSION_TRACES: dict[str, str] = {}
 GO_CORE = ("bash", "edit", "glob", "grep", "read")
 SESSION_RE = re.compile(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}\Z")
 ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -54,12 +66,14 @@ NPM = {"@ai-sdk/openai-compatible": "chat/completions", "@ai-sdk/openai": "respo
 TTL = 900  # Refresh before inference after 15 minutes; never serve an expired snapshot.
 MAX_BODY = 32 * 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
+STREAM_FAILURES = {"error", "network_error", "content_filter", "insufficient_system_resource"}
 
 
 class BridgeError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "BridgePolicyError"):
+    def __init__(self, message: str, status: int = 400, code: str = "BridgePolicyError", *, retry_after: int | None = None):
         super().__init__(message)
         self.status, self.code = status, code
+        self.retry_after = retry_after
 
 
 def removed_route(path: str) -> bool:
@@ -205,6 +219,14 @@ def upstream_connection(proxy: tuple[str, int] | None = None):
     if proxy:
         conn.set_tunnel("opencode.ai", 443)
     return conn
+
+
+def inference_path(lane: str, endpoint: str) -> str:
+    if lane == "go":
+        return f"{BASES[lane]}/{endpoint}"
+    if endpoint == "messages":
+        return "/inference/anthropic/v1/messages"
+    return f"/inference/openai/v1/{endpoint}"
 
 
 def public_get(url: str, timeout: float = 15) -> bytes:
@@ -397,7 +419,8 @@ class Catalog:
         listings, docs, notes = {}, {}, []
         for lane in BASES:
             try:
-                listings[lane] = load_json(self.fetch("https://opencode.ai" + BASES[lane] + "/models"))
+                listing_url = "https://opencode.ai/inference/v1/models" if lane == "zen" else "https://opencode.ai" + BASES[lane] + "/models"
+                listings[lane] = load_json(self.fetch(listing_url))
             except Exception:
                 # Do not keep stale models from an unavailable lane.
                 notes.append(lane + ": listing unavailable; lane disabled")
@@ -430,23 +453,124 @@ class Catalog:
         return copy.deepcopy(fresh)
 
 
+def opencode_version(value="auto", fetch=None) -> str:
+    """Read the official CLI release, not the legacy opencode-ai v1 package.
+
+    Only v2 is qualified. An unavailable/new-major registry keeps the last
+    qualified release; it never changes the wire contract to an untested major.
+    """
+    if value != "auto":
+        if not re.fullmatch(r"2\.[0-9]+\.[0-9]+", value):
+            raise BridgeError("Zen compatibility requires an OpenCode 2.x.y release.")
+        return value
+    try:
+        if fetch is None:
+            conn = http.client.HTTPSConnection("registry.npmjs.org", timeout=5, context=ssl.create_default_context())
+            try:
+                conn.request("GET", "/@opencode%2fcli/latest", headers={"Accept": "application/json"})
+                response = conn.getresponse()
+                if response.status != 200:
+                    return OPENCODE_VERSION
+                raw = response.read(MAX_FRAME + 1)
+            finally:
+                conn.close()
+        else:
+            raw = fetch()
+        if len(raw) > MAX_FRAME:
+            return OPENCODE_VERSION
+        data = load_json(raw)
+        version = data.get("version") if isinstance(data, dict) else None
+        if data.get("name") == "@opencode/cli" and isinstance(version, str) and re.fullmatch(r"2\.[0-9]+\.[0-9]+", version):
+            return version
+    except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException):
+        pass
+    return OPENCODE_VERSION
+
+
+def text_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content
+                         if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return ""
+
+
+def zen_environment(body: dict, endpoint: str, directory=None) -> str:
+    """Append factual environment metadata; preserve the caller's instructions.
+
+    No prompt from an unrelated coding harness is injected, and no instruction
+    grants filesystem access. Tool execution remains entirely with the caller.
+    """
+    messages = body.get("messages" if endpoint != "responses" else "input", [])
+    system = [m for m in messages if isinstance(m, dict) and m.get("role") in {"system", "developer"}] if isinstance(messages, list) else []
+    texts = [text_content(m.get("content")) for m in system]
+    texts.append(text_content(body.get("system" if endpoint == "messages" else "instructions")))
+    if directory is None:
+        for text in texts:
+            match = re.search(r"(?:<cwd>\s*|Working directory: *)(/[^\n<>]+)", text)
+            if match:
+                directory = match[1].strip()
+                break
+    directory = str(Path.cwd()) if directory is None else directory
+    if (not isinstance(directory, str) or not directory or len(directory) > 4096
+            or any(ord(c) < 32 or c in "<>" for c in directory)
+            or not (directory.startswith("/") or re.match(r"[A-Za-z]:[\\/]", directory))):
+        raise BridgeError("A workspace directory must be an absolute path without control characters.")
+    if any(re.search(r"<env>\r?\n  Working directory: [^\n]+\n[\s\S]*?</env>", text) for text in texts):
+        return directory
+    block = ("Here is some useful information about the environment you are running in:\n"
+             f"<env>\n  Working directory: {directory}\n  Workspace root folder: {directory}\n"
+             f"  Platform: {sys.platform}\n</env>")
+    def append(content):
+        if isinstance(content, list):
+            return [*content, {"type": "text", "text": block}]
+        return (content + "\n\n" if isinstance(content, str) and content else "") + block
+    if endpoint in {"messages", "responses"}:
+        key = "system" if endpoint == "messages" else "instructions"
+        body[key] = append(body.get(key))
+    else:
+        first = next((m for m in system if m.get("role") == "system"), None)
+        if first is not None:
+            first["content"] = append(first.get("content"))
+        else:
+            body.setdefault("messages", []).insert(0, {"role": "system", "content": block})
+    return directory
+
+
+def zen_trace(session: str) -> dict:
+    with ID_LOCK:
+        if session not in SESSION_TRACES:
+            if len(SESSION_TRACES) >= 10_000:
+                SESSION_TRACES.pop(next(iter(SESSION_TRACES)))
+            SESSION_TRACES[session] = secrets.token_hex(16)
+        trace = SESSION_TRACES[session]
+    span = secrets.token_hex(8)
+    return {"b3": f"{trace}-{span}-1-{secrets.token_hex(8)}", "traceparent": f"00-{trace}-{span}-01"}
+
+
 def prepare(payload: dict, endpoint: str, headers: dict, compat: bool, ua_version: str, lane: str = "zen") -> tuple[dict, dict, set]:
     body = copy.deepcopy(payload)
     identity = body.pop("_omp_free_session", None)
     body.pop("_omp_free_bridge", None)
+    directory = body.pop("_omp_free_directory", None)
     identity = identity or headers.get("session_id") or headers.get("x-opencode-session") or headers.get("x-claude-code-session-id") or body.get("prompt_cache_key") or headers.get("x-omp-free-session")
     if not isinstance(identity, str) or not identity or len(identity) > 4096:
         raise BridgeError("Missing stable OMP session ID. Load extension.mjs; do not invent one per request.")
     session = session_token(identity)
-    outbound = {"User-Agent": ("opencode/" + ua_version if compat else "omp-free-bridge/" + VERSION),
+    outbound = {"User-Agent": ("opencode/" + (ua_version if lane == "zen" else "1.19.0") if compat else "omp-free-bridge/" + VERSION),
                 "x-opencode-session": session, "Content-Type": "application/json",
                 "Accept-Encoding": "identity"}
     if compat and lane == "zen":
+        directory = zen_environment(body, endpoint, directory)
         outbound.update({
+            "User-Agent": f"opencode/latest/{ua_version}/cli",
+            **zen_trace(session),
             "x-opencode-client": "cli",
-            "x-opencode-project": hashlib.sha1(b"git-remote:github.com/anomalyco/opencode").hexdigest(),
+            "x-opencode-project": hashlib.sha1(("directory:" + directory).encode()).hexdigest(),
             "x-opencode-session-id": session,
             "x-session-affinity": session,
+            "x-session-id": session,
         })
     if endpoint == "messages":
         version = headers.get("anthropic-version", "2023-06-01")
@@ -480,7 +604,10 @@ def prepare(payload: dict, endpoint: str, headers: dict, compat: bool, ua_versio
         for name in core:
             if name not in missing:
                 continue
-            schema = {"type": "object", "properties": {"unused": {"type": "string"}}, "additionalProperties": False}
+            parameter = CORE_PARAMETERS[name] if lane == "zen" else "unused"
+            schema = {"type": "object", "properties": {parameter: {"type": "string"}}, "additionalProperties": False}
+            if lane == "zen":
+                schema["required"] = [parameter]
             stub = {"name": name, "description": "Unavailable in this call. Do not invoke this tool."}
             if endpoint == "messages":
                 stub["input_schema"] = schema
@@ -494,6 +621,118 @@ def prepare(payload: dict, endpoint: str, headers: dict, compat: bool, ua_versio
         # Zen accepts only auto or absent. The response guard below refuses
         # calls to compatibility stubs before any such call reaches OMP.
     return body, outbound, missing
+
+
+def rename_edit_args(arguments: str, fields: dict[str, str]) -> str:
+    values = load_json(arguments)
+    if not isinstance(values, dict) or any(k in values and v in values for k, v in fields.items()):
+        raise ValueError("Invalid or ambiguous edit arguments")
+    return encode({fields.get(k, k): v for k, v in values.items()}).decode()
+
+
+def adapt_omp_edit(body: dict) -> bool:
+    """Translate OMP's string replacement schema into the Zen Chat edit schema."""
+    for tool in body.get("tools", []):
+        function = tool.get("function") or {}
+        if function.get("name") != "edit":
+            continue
+        schema = function.get("parameters") or {}
+        properties = schema.get("properties") or {}
+        if (not {"path", "old_string", "new_string"}.issubset(properties)
+                or properties.keys() & ZEN_EDIT_FIELDS.keys()):
+            return False
+        schema["properties"] = {OMP_EDIT_FIELDS.get(k, k): v for k, v in properties.items()}
+        if isinstance(schema.get("required"), list):
+            schema["required"] = [OMP_EDIT_FIELDS.get(k, k) for k in schema["required"]]
+        description = function.get("description")
+        if isinstance(description, str):
+            for local, wire in OMP_EDIT_FIELDS.items():
+                description = re.sub(rf"\b{local}\b", wire, description)
+            function["description"] = description
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                previous = call.get("function") or {}
+                if previous.get("name") == "edit" and isinstance(previous.get("arguments"), str):
+                    try:
+                        previous["arguments"] = rename_edit_args(previous["arguments"], OMP_EDIT_FIELDS)
+                    except ValueError:
+                        # An incomplete historical call remains available as history.
+                        pass
+        return True
+    return False
+
+
+class ChatEditStream:
+    """Return Chat edit arguments in OMP's schema, including split SSE deltas."""
+    def __init__(self):
+        self.names = {}
+        self.pending = {}
+        self.pending_bytes = 0
+
+    def adapt(self, event: dict) -> bool:
+        changed = False
+        for choice in event.get("choices") or []:
+            choice_index = choice.get("index", 0)
+            delta = choice.get("delta") or {}
+            for call in delta.get("tool_calls") or []:
+                function = call.get("function") or {}
+                key = (choice_index, call.get("index", 0))
+                name = self.names.get(key, "") + (function.get("name") or "")
+                self.names[key] = name
+                arguments = function.get("arguments") or ""
+                if "edit".startswith(name):
+                    if arguments:
+                        self.pending_bytes += len(arguments.encode())
+                        if self.pending_bytes > MAX_FRAME:
+                            raise BridgeError("Streamed edit arguments exceed 2 MiB.", 502, "BridgeToolArgumentsError")
+                        self.pending.setdefault(key, []).append(arguments)
+                        function["arguments"] = ""
+                        changed = True
+                elif key in self.pending:
+                    function["arguments"] = self.take(key) + arguments
+                    changed = True
+            for call in (choice.get("message") or {}).get("tool_calls") or []:
+                function = call.get("function") or {}
+                if function.get("name") == "edit":
+                    function["arguments"] = self.to_omp(function.get("arguments", ""))
+                    changed = True
+            if choice.get("finish_reason"):
+                calls = self.finish_choice(choice_index)
+                if calls:
+                    delta["tool_calls"] = [*(delta.get("tool_calls") or []), *calls]
+                    choice["delta"] = delta
+                    changed = True
+        return changed
+
+    def take(self, key) -> str:
+        arguments = "".join(self.pending.pop(key))
+        self.pending_bytes -= len(arguments.encode())
+        return arguments
+
+    def finish_choice(self, choice_index) -> list[dict]:
+        calls = []
+        for key in list(self.pending):
+            if key[0] != choice_index:
+                continue
+            arguments = self.take(key)
+            if self.names[key] == "edit":
+                arguments = self.to_omp(arguments)
+            calls.append({"index": key[1], "function": {"arguments": arguments}})
+        return calls
+
+    def finish(self) -> bytes:
+        choices = [{"index": index, "delta": {"tool_calls": self.finish_choice(index)}, "finish_reason": None}
+                   for index in dict.fromkeys(key[0] for key in self.pending)]
+        return b"data: " + encode({"choices": choices}) + b"\n\n" if choices else b""
+
+    @staticmethod
+    def to_omp(arguments: str) -> str:
+        try:
+            return rename_edit_args(arguments, ZEN_EDIT_FIELDS)
+        except (ValueError, TypeError) as exc:
+            raise BridgeError("Zen returned invalid edit arguments.", 502, "BridgeToolArgumentsError") from exc
 
 
 class StreamGuard:
@@ -569,7 +808,7 @@ def error_object(exc: BridgeError, endpoint: str = "chat/completions") -> dict:
     return {"error": detail}
 
 
-def error_info(status: int, raw: bytes, key: str) -> tuple[BridgeError, float]:
+def error_info(status: int, raw: bytes, key: str, *, zen: bool = False) -> tuple[BridgeError, float]:
     text = raw.decode("utf-8", "replace")
     code = "UpstreamError"
     try:
@@ -585,17 +824,36 @@ def error_info(status: int, raw: bytes, key: str) -> tuple[BridgeError, float]:
     text = text[:2000]
     wait = 0
     if status == 429:
+        if zen and code == "server_error" and text.startswith("The inference service is overloaded."):
+            return BridgeError(text, 429, "ZenOverloaded"), 0
         wait = 60
-        text += " [Quota/rate limit; NOT a successful model answer.]"
+        text += " [Free-tier refusal: quota OR client policy; NOT a successful model answer.]"
     if status in {401, 402, 403}:
         text += " [No retry, key rotation, balance fallback or paid-model substitution. Restart only after resolving the cause.]"
     return BridgeError(text, status, code), wait
 
 
+def retry_after_seconds(value: str | None, received_at: float) -> int | None:
+    if value is None:
+        return None
+    try:
+        value = value.strip()
+        if re.fullmatch(r"[0-9]+", value):
+            seconds = int(value.lstrip("0") or "0")
+            # Bound timestamps to the range used by the diagnostic date formatter.
+            return seconds if received_at + seconds <= 253402300799 else None
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(0, math.ceil(date.timestamp() - received_at))
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
 def quota_reset(until: float, now: float | None = None) -> str:
     left = max(0, int(until - (time.time() if now is None else now)))
     stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(round(until)))
-    return f"Resets at {stamp} (in {left // 3600}h {left % 3600 // 60}m)"
+    return f"Retry-After deadline {stamp} (in {left // 3600}h {left % 3600 // 60}m); availability after it is not guaranteed"
 
 
 LANE_NAMES = {"zen": "OpenCode Zen", "go": "OpenCode Go"}
@@ -605,6 +863,9 @@ class RouteStats:
     """Cumulative Zen counters, persisted atomically without prompts or credentials."""
     FIELDS = {"inference": ("attempts", "successes", "http_429", "transport_errors"),
               "ip_checks": ("attempts", "successes", "errors")}
+    SOURCES = {"request", "probe", "omp"}
+    OUTCOMES = {"completed", "http_error", "stream_error", "transport_error", "no_verified_answer"}
+    LATEST_LIMIT = 512
 
     @classmethod
     def empty_route(cls):
@@ -615,7 +876,7 @@ class RouteStats:
         self.lock = threading.Lock()
         self.persistence_error = None
         now = time.time()
-        self.data = {"schema": 1, "started_at": now, "updated_at": now, "routes": {}}
+        self.data = {"schema": 1, "started_at": now, "updated_at": now, "routes": {}, "latest": []}
         if self.path is not None and self.path.exists():
             try:
                 data = load_json(read_private(self.path))
@@ -632,6 +893,9 @@ class RouteStats:
                                        for field in fields)):
                             raise ValueError
                 self.data = data
+                latest = data.get("latest")
+                self.data["latest"] = ([row for row in latest[:self.LATEST_LIMIT] if self.valid_outcome(row)]
+                                       if isinstance(latest, list) else [])
             except (BridgeError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
                 raise BridgeError("Invalid zen-stats.json; refusing to discard saved counters.") from exc
         for name in routes:
@@ -657,6 +921,37 @@ class RouteStats:
             self.data["updated_at"] = time.time()
             self._save()
 
+    @classmethod
+    def valid_outcome(cls, row):
+        if not isinstance(row, dict) or set(row) != {"route", "model", "source", "http", "outcome", "at"}:
+            return False
+        status, stamp = row["http"], row["at"]
+        return (all(isinstance(row[key], str) for key in ("route", "model", "source", "outcome"))
+                and 0 < len(row["route"]) <= 255 and bool(ID_RE.fullmatch(row["model"]))
+                and row["source"] in cls.SOURCES and row["outcome"] in cls.OUTCOMES
+                and (status is None or type(status) is int and 100 <= status <= 599)
+                and type(stamp) in (int, float) and 0 <= stamp <= time.time() + 60)
+
+    def outcome(self, route, model, source, status, outcome, *, counter=None, at=None):
+        stamp = time.time() if at is None else at
+        entry = {"route": route, "model": model, "source": source, "http": status, "outcome": outcome, "at": stamp}
+        with self.lock:
+            if counter is not None:
+                row = self.data["routes"].setdefault(route, self.empty_route())
+                row["inference"][counter] += 1
+            if self.valid_outcome(entry):
+                records = self.data["latest"]
+                key = (route, model, source)
+                previous = next((r for r in records if (r["route"], r["model"], r["source"]) == key), None)
+                if previous is None or previous["at"] <= stamp:
+                    if previous is not None:
+                        records.remove(previous)
+                    records.append(entry)
+                    records.sort(key=lambda result: result["at"], reverse=True)
+                    del records[self.LATEST_LIMIT:]
+            self.data["updated_at"] = time.time()
+            self._save()
+
     def snapshot(self, routes=()):
         with self.lock:
             result = copy.deepcopy(self.data)
@@ -670,19 +965,23 @@ class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, catalog, key, token, compat=False, ua_version="1.19.0", connector=None, zen_proxies=(), state=None):
+    def __init__(self, address, catalog, key, token, compat=False, ua_version=OPENCODE_VERSION, connector=None,
+                 zen_proxies=(), state=None, zen_connector=None, *, starting=False):
         super().__init__(address, Handler)
         self.catalog, self.key, self.token = catalog, key, token
         self.compat, self.ua_version = compat, ua_version
         self.connector = connector or upstream_connection
+        self.zen_connector = zen_connector
+        self.zen_client_profile = "opencode2-bun" if zen_connector else "python"
         self.zen_proxies = tuple(zen_proxies)
         self.proxy_until = [0.0] * len(self.zen_proxies)
-        self.zen_route_quotas = {}
         self.zen_route_ips = {}
         self.zen_route_revisions = {}
         self.zen_last_429 = {}
         self.cooldowns, self.lane_cooldowns, self.blocked = {}, {}, {}
         self.lock = threading.Lock()
+        self.started_at = time.time()
+        self.startup = {"phase": "starting" if starting else "ready", "since": self.started_at}
         self.direct_transport_until = 0.0
         self.ip_observations = {}
         self.ip_monitor_error = None
@@ -709,6 +1008,45 @@ class BridgeServer(ThreadingHTTPServer):
         except Exception:
             self.server_close()
             raise
+
+    def set_startup(self, phase, error=None):
+        with self.lock:
+            self.startup = {"phase": phase, "since": time.time(), **({"error": error} if error else {})}
+
+    def activate(self, version, transport):
+        with self.lock:
+            self.ua_version = version
+            self.zen_connector = transport.connection if transport else None
+            self.zen_client_profile = "opencode2-bun" if transport else "python"
+            self.startup = {"phase": "ready", "since": time.time()}
+
+    def check_ready(self):
+        with self.lock:
+            phase = self.startup["phase"]
+        if phase == "catalog_unavailable":
+            raise BridgeError("Verified free-model catalog unavailable. The bridge will retry.",
+                              503, "CatalogUnavailable", retry_after=CATALOG_STARTUP_RETRY)
+        if phase == "startup_failed":
+            raise BridgeError("Bridge startup failed. Run bridge.py doctor for details.", 503, "BridgeStartupFailed")
+        if phase != "ready":
+            raise BridgeError("Bridge is starting. Run bridge.py doctor for the current stage.",
+                              503, "BridgeStarting", retry_after=2)
+
+    def warp_readiness(self):
+        # Caller holds lock. An IP saved before this process began is historical.
+        readiness = {"configured": len(self.zen_proxies), "verified": 0, "unavailable": 0, "pending": 0}
+        for i in range(len(self.zen_proxies)):
+            row = self.ip_observations.get(self.route_key(i), {})
+            stamp = row.get("attempted_at" if row.get("error") else "observed_at")
+            if not isinstance(stamp, (int, float)) or not stamp >= self.started_at:
+                readiness["pending"] += 1
+            elif row.get("error"):
+                readiness["unavailable"] += 1
+            elif row.get("ip"):
+                readiness["verified"] += 1
+            else:
+                readiness["pending"] += 1
+        return readiness
 
     def refresh_zen_ips(self):
         """Confirm exit IPs; clear only the changed WARP's previous cooldowns."""
@@ -741,8 +1079,7 @@ class BridgeServer(ThreadingHTTPServer):
             observations = list(pool.map(measure, routes))
         with self.lock:
             proxies = {self.route_key(i): i for i in range(len(self.zen_proxies))}
-            before = (self.zen_route_quotas.copy(), self.proxy_until[:], self.zen_route_ips.copy(),
-                      self.zen_route_revisions.copy())
+            before = (self.proxy_until[:], self.zen_route_ips.copy(), self.zen_route_revisions.copy())
             updated_observations = {}
             for name, observed in observations:
                 previous = self.ip_observations.get(name, {})
@@ -754,22 +1091,19 @@ class BridgeServer(ThreadingHTTPServer):
                 else:
                     updated.setdefault("changes", 0)
                 if name in proxies and observed.get("ip"):
-                    # The binding lives with the deadlines, so a stale/missing IP
-                    # history file cannot clear a newer refusal after restart.
+                    # Use the IP bound to the transport deadline before the trace history.
                     known_ip = self.zen_route_ips.get(name, previous.get("ip"))
                     if known_ip and known_ip != observed["ip"]:
-                        self.zen_route_quotas.pop(name, None)
                         self.proxy_until[proxies[name]] = 0.0
                         self.zen_route_revisions[name] = self.zen_route_revisions.get(name, 0) + 1
                         updated["cooldown_reset_at"] = observed["observed_at"]
                     self.zen_route_ips[name] = observed["ip"]
                 updated_observations[name] = updated
-            if self.zen_route_ips != before[2]:
+            if self.zen_route_ips != before[1]:
                 try:
                     self.save_zen_cooldowns()
                 except OSError:
-                    (self.zen_route_quotas, self.proxy_until, self.zen_route_ips,
-                     self.zen_route_revisions) = before
+                    self.proxy_until, self.zen_route_ips, self.zen_route_revisions = before
                     raise
             self.ip_observations = updated_observations
             self.ip_monitor_error = None
@@ -798,24 +1132,17 @@ class BridgeServer(ThreadingHTTPServer):
         try:
             data = load_json(read_private(self.cooldown_path))
             if data.get("schema") == 1:
-                # Legacy direct_until is retained only for the direct route.
-                # Old per-proxy pauses may include quotas; never discard them on upgrade.
-                direct, proxies = data["direct_until"], data["proxies"]
-                quotas = {"direct": direct, **proxies}
-                transport = {}
-                direct_transport = 0.0
-                ips = {}
-                last_429 = {}
-            elif data.get("schema") == 2:
-                quotas, transport = data["quotas"], data["transport"]
-                direct_transport = data.get("direct_transport_until", 0.0)
-                ips = data.get("ips", {})
-                last_429 = data.get("last_429", {})
-            else:
+                # Schema 1 cannot distinguish upstream rate limits from transport failures.
+                return
+            if data.get("schema") != 2:
                 raise ValueError
-            if (not isinstance(quotas, dict) or not isinstance(transport, dict)
+            transport = data["transport"]
+            direct_transport = data.get("direct_transport_until", 0.0)
+            ips = data.get("ips", {})
+            last_429 = data.get("last_429", {})
+            if (not isinstance(transport, dict)
                     or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
-                           for value in [direct_transport, *quotas.values(), *transport.values()])):
+                           for value in [direct_transport, *transport.values()])):
                 raise ValueError
             if not isinstance(ips, dict) or any(not isinstance(name, str) or not isinstance(ip, str)
                                               for name, ip in ips.items()):
@@ -836,18 +1163,19 @@ class BridgeServer(ThreadingHTTPServer):
                 if until is not None and (type(until) not in (int, float) or not math.isfinite(until) or until < 0):
                     raise ValueError
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
-            raise BridgeError("Invalid zen-cooldowns.json; refusing to discard known quota cooldowns.") from exc
-        self.zen_route_quotas = quotas
+            raise BridgeError("Invalid zen-cooldowns.json; cannot load Zen diagnostics and transport state.") from exc
+        # Historical rate-limit deadlines are diagnostic only, even after restarting.
         self.zen_route_ips = ips
         self.zen_last_429 = last_429
         self.direct_transport_until = direct_transport
         self.proxy_until = [transport.get(f"{host}:{port}", 0.0) for host, port in self.zen_proxies]
 
     def save_zen_cooldowns(self):
-        # Caller holds lock. Persist by endpoint, so adding/reordering slots keeps known limits.
+        # Caller holds lock. Keep an empty quotas map for older bridge readers.
         if self.cooldown_path is not None:
             save_private(self.cooldown_path, encode({"schema": 2,
-                "quotas": self.zen_route_quotas,
+                "client_profile": self.zen_client_profile,
+                "quotas": {},
                 "ips": self.zen_route_ips,
                 "last_429": self.zen_last_429,
                 "direct_transport_until": self.direct_transport_until,
@@ -855,8 +1183,7 @@ class BridgeServer(ThreadingHTTPServer):
                             for (host, port), until in zip(self.zen_proxies, self.proxy_until)}}))
 
     def record_zen_429(self, route, received_at, retry_after):
-        # Record the actual response even if reading its body fails or its old IP
-        # revision can no longer put the route on pause. Caller supplies no body.
+        # Record the actual response even if reading its body fails.
         with self.lock:
             previous = self.zen_last_429.get(route)
             if previous and previous["received_at"] > received_at:
@@ -867,13 +1194,12 @@ class BridgeServer(ThreadingHTTPServer):
 
     def route_cooldown_info(self, route, transport, now):
         # Caller holds lock; history and deadlines must come from one snapshot.
-        quota = self.zen_route_quotas.get(route, 0)
-        until = max(quota, transport)
-        return {"cooldown_seconds": max(0, math.ceil(until - now)),
-                "quota_cooldown_seconds": max(0, math.ceil(quota - now)),
-                "transport_cooldown_seconds": max(0, math.ceil(transport - now)),
-                "cooldown_until": until if until > now else None,
-                "quota_cooldown_until": quota or None,
+        seconds = max(0, math.ceil(transport - now))
+        return {"cooldown_seconds": seconds,
+                "quota_cooldown_seconds": 0,
+                "transport_cooldown_seconds": seconds,
+                "cooldown_until": transport if seconds else None,
+                "quota_cooldown_until": None,
                 "transport_cooldown_until": transport or None,
                 "last_429": copy.deepcopy(self.zen_last_429.get(route))}
 
@@ -887,9 +1213,7 @@ class BridgeServer(ThreadingHTTPServer):
             if lane in self.blocked:
                 raise BridgeError("Lane stopped after upstream auth/policy/payment denial. Resolve the cause, then restart the bridge.", 409, "UpstreamLaneStopped")
             now = time.time()
-            deadlines = [(None, max(self.direct_transport_until, self.zen_route_quotas.get("direct", 0.0)))]
-            deadlines.extend((index, max(until, self.zen_route_quotas.get(self.route_key(index), 0.0)))
-                             for index, until in enumerate(self.proxy_until))
+            deadlines = [(None, self.direct_transport_until), *enumerate(self.proxy_until)]
             for index, until in deadlines:
                 if index not in attempted and until <= now:
                     return index
@@ -897,9 +1221,9 @@ class BridgeServer(ThreadingHTTPServer):
                 raise BridgeError("All available Zen routes were already tried for this request.",
                                   503, "ZenRoutesExhausted")
             until = min(until for _, until in deadlines)
-            raise BridgeError(f"All configured Zen routes are in cooldown. Retry in {math.ceil(until - now)}s. "
-                              f"{quota_reset(until)}. No additional upstream call was made.",
-                              503, "ZenProxyCooldown")
+            delay = math.ceil(until - now)
+            raise BridgeError(f"All configured Zen routes are in transport cooldown. Retry in {delay}s.",
+                              503, "ZenProxyCooldown", retry_after=delay)
 
     def cool_proxy(self, index, seconds: float, revision=None):
         if index is not None:
@@ -910,11 +1234,14 @@ class BridgeServer(ThreadingHTTPServer):
                 self.save_zen_cooldowns()
 
     def connect_upstream(self, lane: str, proxy=None):
+        if lane == "zen" and self.zen_connector is not None:
+            return self.zen_connector(self.zen_proxies[proxy] if proxy is not None else None)
         if lane == "zen" and proxy is not None:
             return upstream_connection(self.zen_proxies[proxy])
         return self.connector()
 
     def check_model(self, lane: str, model_id: str, endpoint: str):
+        self.check_ready()
         with self.lock:
             if lane in self.blocked:
                 raise BridgeError("Lane stopped after upstream auth/policy/payment denial. Resolve the cause, then restart the bridge.", 409, "UpstreamLaneStopped")
@@ -940,6 +1267,8 @@ class Handler(BaseHTTPRequestHandler):
         proxy = getattr(self, "zen_proxy_index", None)
         if hasattr(self, "zen_proxy_index"):
             self.send_header("X-OMP-Zen-Route", "direct" if proxy is None else "warp")
+            if self.headers.get("X-OMP-Bridge-Probe") == "probe":
+                self.send_header("X-OMP-Zen-Endpoint", self.server.route_key(proxy))
         if proxy is not None:
             self.send_header("X-OMP-Zen-Proxy", str(proxy + 1))
         super().end_headers()
@@ -959,21 +1288,52 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(key.encode(), self.server.token.encode()):
             raise BridgeError("Invalid local proxy token (not the Zen key).", 401)
 
-    def send_json(self, status: int, value):
+    def send_json(self, status: int, value, *, retry_after: int | None = None):
         raw = encode(value)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(raw)
         self.close_connection = True
 
+    def read_payload(self, limit=MAX_BODY):
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
+            raise BridgeError("Chunked/compressed request bodies are not supported.")
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not lengths[0].isdigit():
+            raise BridgeError("One Content-Length is required.", 411)
+        length = int(lengths[0])
+        if not 0 < length <= limit:
+            raise BridgeError(f"Request body must be 1 byte to {limit // (1024 * 1024)} MiB."
+                              if limit == MAX_BODY else "Probe report is too large.", 413)
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise BridgeError("Incomplete request body.")
+        try:
+            return load_json(raw)
+        except (ValueError, UnicodeError) as exc:
+            raise BridgeError("Malformed JSON request.") from exc
+
+    def record_probe_report(self):
+        reports = self.read_payload(16384)
+        allowed = {"direct", *(self.server.route_key(i) for i in range(len(self.server.zen_proxies)))}
+        if (not isinstance(reports, list) or not 0 < len(reports) <= 64
+                or any(not RouteStats.valid_outcome(row) or row["source"] != "probe" or row["route"] not in allowed
+                       for row in reports)):
+            raise BridgeError("Invalid route probe report.")
+        for row in reports:
+            self.server.stats.outcome(row["route"], row["model"], "probe", row["http"], row["outcome"], at=row["at"])
+        self.send_json(200, {"ok": True})
+
     def fail(self, exc: BridgeError, endpoint: str, started: bool):
         try:
             if not started:
-                return self.send_json(exc.status, error_object(exc, endpoint))
+                return self.send_json(exc.status, error_object(exc, endpoint), retry_after=exc.retry_after)
             prefix = b"event: error\n" if endpoint in {"responses", "messages"} else b""
             self.wfile.write(prefix + b"data: " + encode(error_object(exc, endpoint)) + b"\n\n")
             self.wfile.flush()
@@ -1000,18 +1360,27 @@ class Handler(BaseHTTPRequestHandler):
                             groups.setdefault(observed["ip"], []).append(name)
                     duplicates = {ip: names for ip, names in groups.items() if len(names) > 1}
                     monitor_error = self.server.ip_monitor_error
-                return self.send_json(200, {"ok": True, "version": VERSION,
-                    "compat_opencode": self.server.compat, "zen_proxy": bool(proxies),
+                    startup, warp = self.server.startup.copy(), self.server.warp_readiness()
+                    version, profile = self.server.ua_version, self.server.zen_client_profile
+                    transport = "bun" if self.server.zen_connector else "python"
+                ready = startup["phase"] == "ready"
+                return self.send_json(200, {"ok": ready, "version": VERSION,
+                    "startup": startup, "warp_readiness": warp,
+                    "compat_opencode": self.server.compat, "opencode_version": version,
+                    "zen_compatibility": "v2", "zen_client_profile": profile, "zen_transport": transport, "zen_proxy": bool(proxies),
                     "zen_routing": "direct-first", "zen_quota_failover": bool(proxies),
+                    "zen_429_policy": "request-only",
                     "zen_route_order": ["direct", *(f"warp-{i + 1}" for i in range(len(proxies)))],
                     "zen_direct": direct,
                     "zen_proxies": proxies, "blocked_lanes": blocked,
                     "ip_observations": addresses, "duplicate_ips": duplicates, "ip_monitor_error": monitor_error,
                     "zen_stats": self.server.stats.snapshot(["direct", *(self.server.route_key(i) for i in range(len(proxies)))])})
             if self.path == "/catalog":
+                self.server.check_ready()
                 return self.send_json(200, self.server.catalog.get())
             for lane in BASES:
                 if self.path == f"/{lane}/v1/models":
+                    self.server.check_ready()
                     ids = dict.fromkeys(r["id"] for r in self.server.catalog.get()["models"] if r["lane"] == lane)
                     data = [{"id": mid, "object": "model", "owned_by": "opencode"} for mid in ids]
                     return self.send_json(200, {"object": "list", "data": data})
@@ -1019,7 +1388,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise BridgeError(REMOVED_ROUTE, 404, "RouteRemoved")
             raise BridgeError("Unknown local endpoint.", 404)
         except BridgeError as exc:
-            self.send_json(exc.status, error_object(exc))
+            self.send_json(exc.status, error_object(exc), retry_after=exc.retry_after)
         except (OSError, ValueError):
             self.close_connection = True
 
@@ -1034,6 +1403,8 @@ class Handler(BaseHTTPRequestHandler):
         endpoint = "chat/completions"
         try:
             self.check_client()
+            if self.path == "/probe/results":
+                return self.record_probe_report()
             parts = self.path.split("/", 3)
             if removed_route(self.path):
                 # Answer in the old provider's own protocol envelope so OMP shows the text.
@@ -1042,24 +1413,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) != 4 or parts[1] not in BASES or parts[2] != "v1" or parts[3] not in APIS:
                 raise BridgeError("Unknown local inference endpoint.", 404)
             lane, endpoint = parts[1], parts[3]
-            if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
-                raise BridgeError("Chunked/compressed request bodies are not supported.")
-            lengths = self.headers.get_all("Content-Length", [])
-            if len(lengths) != 1 or not lengths[0].isdigit():
-                raise BridgeError("One Content-Length is required.", 411)
-            length = int(lengths[0])
-            if not 0 < length <= MAX_BODY:
-                raise BridgeError("Request body must be 1 byte to 32 MiB.", 413)
-            raw = self.rfile.read(length)
-            if len(raw) != length:
-                raise BridgeError("Incomplete request body.")
-            try:
-                payload = load_json(raw)
-            except (ValueError, UnicodeError) as exc:
-                raise BridgeError("Malformed JSON request.") from exc
+            payload = self.read_payload()
             if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
                 raise BridgeError("JSON object with a model ID is required.")
             model_id = payload["model"]
+            source = self.headers.get("X-OMP-Bridge-Probe")
+            if source not in RouteStats.SOURCES:
+                source = "request"
             self.server.check_model(lane, model_id, endpoint)
             if lane == "go" and not self.server.key:
                 raise BridgeError("OpenCode Go requires an API key. Run bridge.py login.", 401, "GoCredentialsMissing")
@@ -1069,9 +1429,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 headers["Authorization"] = "Bearer public"
             headers["Accept"] = "text/event-stream"
-            upstream_path = BASES[lane] + "/" + endpoint if lane == "go" else ("/inference/anthropic/v1/messages" if endpoint == "messages" else "/inference/openai/v1/" + endpoint)
+            upstream_path = inference_path(lane, endpoint)
+            edit_stream = (ChatEditStream() if lane == "zen" and self.server.compat
+                           and endpoint == "chat/completions" and adapt_omp_edit(body) else None)
             wire_body = encode(body)
             attempted = set()
+            last_quota_error = None
+            overload_retried = False
             # Abort upstream when the local client disconnects, including a long thinking pause.
             def watch_disconnect():
                 while not finished.wait(0.25):
@@ -1094,7 +1458,12 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=watch_disconnect, daemon=True).start()
             while not finished.is_set():
                 self.server.check_model(lane, model_id, endpoint)
-                proxy = self.server.select_proxy(lane, headers["x-opencode-session"], attempted)
+                try:
+                    proxy = self.server.select_proxy(lane, headers["x-opencode-session"], attempted)
+                except BridgeError as exc:
+                    if last_quota_error is not None and exc.code in {"ZenRoutesExhausted", "ZenProxyCooldown"}:
+                        raise last_quota_error from exc
+                    raise
                 if lane == "zen":
                     self.zen_proxy_index = proxy
                     self.server.stats.record(self.server.route_key(proxy), "inference", "attempts")
@@ -1107,40 +1476,53 @@ class Handler(BaseHTTPRequestHandler):
                 conn.request("POST", upstream_path, body=wire_body, headers=headers)
                 response = conn.getresponse()
                 received_at = time.time()
-                if lane == "zen" and response.status == 429:
-                    self.server.stats.record(self.server.route_key(proxy), "inference", "http_429")
-                    self.server.record_zen_429(self.server.route_key(proxy), received_at,
-                                               response.getheader("Retry-After"))
+                zen_429 = lane == "zen" and response.status == 429
+                retry = response.getheader("Retry-After") if response.status == 429 else None
+                if lane == "zen" and response.status != 200:
+                    self.server.stats.outcome(self.server.route_key(proxy), model_id, source, response.status,
+                                              "http_error", counter="http_429" if zen_429 else None, at=received_at)
+                if zen_429:
+                    self.server.record_zen_429(self.server.route_key(proxy), received_at, retry)
                 if response.status == 200:
                     break
-                exc, wait = error_info(response.status, response.read(16384), self.server.key)
-                retry = response.getheader("Retry-After", "") if response.status == 429 else ""
-                # Honor the full quota reset, scoped to this exit when a pool is configured.
+                exc, wait = error_info(response.status, response.read(16384), self.server.key, zen=zen_429)
+                retry_delay = retry_after_seconds(retry, received_at)
+                overloaded = zen_429 and exc.code == "ZenOverloaded" and wait == 0
                 lane_quota = response.status == 429 and exc.code == "FreeUsageLimitError"
                 if lane_quota:
-                    wait = max(wait, int(retry)) if retry.isdigit() else wait
-                    exc = BridgeError(f"{exc} {quota_reset(time.time() + wait)}.", exc.status, exc.code)
-                elif retry.isdigit():
+                    wait = max(wait, retry_delay or 0)
+                    if not zen_429 or retry_delay is not None:
+                        deadline = received_at + (retry_delay if zen_429 else wait)
+                        exc = BridgeError(f"{exc} {quota_reset(deadline)}.", exc.status, exc.code)
+                elif not zen_429 and retry_delay is not None:
                     # A day-long per-model cooldown can only be cleared by a restart,
                     # which is the one thing this bridge tells users not to do.
-                    wait = max(wait, min(int(retry), 3600))
+                    wait = max(wait, min(retry_delay, 3600))
                 with self.server.lock:
                     if response.status in {401, 402, 403}:
                         self.server.blocked[lane] = response.status
-                    if lane == "zen" and response.status == 429:
+                    if zen_429:
                         route = self.server.route_key(proxy)
-                        applied = revision == self.server.zen_route_revisions.get(route, 0)
-                        if applied:
-                            self.server.zen_route_quotas[route] = max(self.server.zen_route_quotas.get(route, 0), time.time() + wait)
                         record = self.server.zen_last_429.get(route)
                         if record and record["received_at"] == received_at:
-                            record.update(code=exc.code, cooldown_applied=applied,
-                                          cooldown_until=self.server.zen_route_quotas[route] if applied else None)
-                        self.server.save_zen_cooldowns()
+                            record["code"] = exc.code
+                            self.server.save_zen_cooldowns()
                     elif lane_quota:
                         self.server.lane_cooldowns[lane] = max(self.server.lane_cooldowns.get(lane, 0), time.time() + wait)
                     elif proxy is None and wait:
                         self.server.cooldowns[(lane, model_id)] = time.time() + wait
+                if zen_429:
+                    exc.retry_after = retry_delay
+                if overloaded:
+                    delay = 1 if retry_delay is None else retry_delay
+                    if not overload_retried and delay <= ZEN_OVERLOAD_MAX_WAIT:
+                        overload_retried = True
+                        conn.close()
+                        conn = response = None
+                        upstream_io = False
+                        attempted.remove(proxy)
+                        finished.wait(delay)
+                        continue
                 if 500 <= response.status <= 599:
                     self.server.cool_proxy(proxy, 30, revision)
                     if lane == "zen" and proxy is None:
@@ -1149,6 +1531,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Only an explicit quota refusal before SSE permits another POST.
                     # Keep the exact body/session, close this connection, and recheck
                     # model admission and lane state before selecting the next exit.
+                    last_quota_error = exc
                     conn.close()
                     conn = response = None
                     upstream_io = False
@@ -1173,6 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
             for frame, data in sse_events(response):
                 if data == b"[DONE]":
                     terminal = True
+                    if edit_stream and not stream_failed:
+                        frame = edit_stream.finish() + frame
                 elif data:
                     event = load_json(data)
                     guard.inspect(event)
@@ -1180,21 +1565,28 @@ class Handler(BaseHTTPRequestHandler):
                     stream_failed |= isinstance(event, dict) and ("error" in event or event.get("type") in {
                         "error", "response.failed", "response.incomplete"})
                     if endpoint == "chat/completions" and isinstance(event, dict):
-                        stream_failed |= any(isinstance(choice, dict) and choice.get("finish_reason") in {
-                            "error", "network_error", "content_filter", "insufficient_system_resource"}
-                            for choice in event.get("choices") or [])
+                        stream_failed |= any(
+                            isinstance(choice, dict) and choice.get("finish_reason") in STREAM_FAILURES
+                            for choice in event.get("choices") or []
+                        )
+                        if edit_stream and not stream_failed and edit_stream.adapt(event):
+                            frame = b"data: " + encode(event) + b"\n\n"
                 upstream_io = False
                 self.wfile.write(frame)
                 self.wfile.flush()
                 upstream_io = True
             if not terminal:
                 raise BridgeError("Upstream stream ended without a terminal event. Do not treat this as a completed answer.", 502, "TruncatedStream")
-            if lane == "zen" and not stream_failed and not finished.is_set():
-                self.server.stats.record(self.server.route_key(proxy), "inference", "successes")
+            if lane == "zen" and not finished.is_set():
+                self.server.stats.outcome(self.server.route_key(proxy), model_id, source, 200,
+                                          "stream_error" if stream_failed else "completed",
+                                          counter=None if stream_failed else "successes")
         except BridgeError as exc:
-            if not finished.is_set() and exc.code in {"TruncatedStream", "UnexpectedResponse"}:
-                if lane == "zen" and attempt_counted:
-                    self.server.stats.record(self.server.route_key(proxy), "inference", "transport_errors")
+            failed_stream = exc.code in {"TruncatedStream", "UnexpectedResponse"}
+            if not finished.is_set() and lane == "zen" and attempt_counted and response and response.status == 200:
+                self.server.stats.outcome(self.server.route_key(proxy), model_id, source, 200, "stream_error",
+                                          counter="transport_errors" if failed_stream else None)
+            if not finished.is_set() and failed_stream:
                 self.server.cool_proxy(proxy, 30, revision)
                 if lane == "zen" and proxy is None:
                     self.server.cool_direct_transport()
@@ -1202,7 +1594,12 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException) as exc:
             if upstream_io and not finished.is_set():
                 if lane == "zen" and attempt_counted:
-                    self.server.stats.record(self.server.route_key(proxy), "inference", "transport_errors")
+                    status = response.status if response is not None else None
+                    if status in {None, 200}:
+                        self.server.stats.outcome(self.server.route_key(proxy), model_id, source, status,
+                                                  "transport_error", counter="transport_errors")
+                    else:
+                        self.server.stats.record(self.server.route_key(proxy), "inference", "transport_errors")
                 self.server.cool_proxy(proxy, 30, revision)
                 if lane == "zen" and proxy is None:
                     self.server.cool_direct_transport()
@@ -1216,69 +1613,206 @@ class Handler(BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def local_request(path: str, payload: dict | None = None):
+def local_request(path: str, payload: dict | list | None = None, *, probe=False):
     port = load_json((STATE / "runtime.json").read_bytes())["port"]
     token = read_private(STATE / "local.token")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise BridgeError("Bad runtime port.")
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
     try:
+        headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+        if probe:
+            headers["X-OMP-Bridge-Probe"] = "probe"
         conn.request("POST" if payload is not None else "GET", path,
-                     body=encode(payload) if payload is not None else None,
-                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                     body=encode(payload) if payload is not None else None, headers=headers)
         yield conn.getresponse()
     finally:
         conn.close()
 
 
-def probe(rows: list[dict]):
-    results = []
-    for row in rows:
-        payload = {"model": row["id"], "stream": True, "_omp_free_session": "diagnostic-" + secrets.token_hex(16)}
-        if row["endpoint"] == "responses":
-            payload.update(input="For a coding-agent connectivity check, reply with exactly BRIDGE_OK. Do not invoke tools.", max_output_tokens=1024)
-        else:
-            payload.update(messages=[{"role": "user", "content": "For a coding-agent connectivity check, reply with exactly BRIDGE_OK. Do not invoke tools."}], max_tokens=1024)
+def probe_payload(row):
+    prompt = "For a coding-agent connectivity check, reply with exactly BRIDGE_OK. Do not invoke tools."
+    payload = {"model": row["id"], "stream": True, "_omp_free_session": "diagnostic-" + secrets.token_hex(16)}
+    if row["endpoint"] == "responses":
+        payload.update(input=prompt, max_output_tokens=1024)
+    else:
+        payload.update(messages=[{"role": "user", "content": prompt}], max_tokens=1024)
+    if row["endpoint"] == "chat/completions":
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def probe_reply(row, response):
+    result = {"http": response.status}
+    retry_after = response.getheader("Retry-After")
+    if retry_after is not None:
+        result["retry_after"] = retry_after
+    if response.status != 200:
+        raw = response.read(16384)
         try:
-            with local_request(f'/{row["lane"]}/v1/{row["endpoint"]}', payload) as response:
-                status, text, terminal, error, called_tool = response.status, [], False, None, False
-                if status == 200:
-                    for _, data in sse_events(response):
-                        if data == b"[DONE]":
-                            terminal = True
-                            continue
-                        if not data:
-                            continue
-                        e = load_json(data)
-                        if e.get("error") or e.get("type") in {"error", "response.failed", "response.incomplete"}:
-                            error = e
-                        if e.get("type") == "response.output_text.delta":
-                            text.append(e.get("delta", ""))
-                        elif e.get("type") == "content_block_delta":
-                            text.append(e.get("delta", {}).get("text", ""))
-                        for c in e.get("choices", []):
-                            text.append(c.get("delta", {}).get("content") or "")
-                            called_tool |= bool(c.get("delta", {}).get("tool_calls"))
-                        called_tool |= (e.get("item") or {}).get("type") == "function_call" or (e.get("content_block") or {}).get("type") == "tool_use"
-                        terminal |= is_terminal(e, row["endpoint"]) and not error
-                    passed = terminal and not error and not called_tool and "".join(text).strip() == "BRIDGE_OK"
-                    result = "MODEL_ANSWER_CONFIRMED" if passed else "NO_VERIFIED_ANSWER"
-                else:
-                    error = load_json(response.read(16384))
-                    result = "QUOTA_LIMIT_NOT_SUCCESS" if status == 429 else "FAILED"
-                item = {"lane": row["lane"], "model": row["id"], "http": status, "result": result}
-                if error:
-                    item["error"] = error
-                results.append(item)
-                print(json.dumps(item, ensure_ascii=False))
-                if status in {401, 402, 403, 409, 429}:
-                    break
-        except (OSError, ValueError, BridgeError, http.client.HTTPException) as exc:
-            results.append({"lane": row["lane"], "model": row["id"], "result": "TRANSPORT_FAILURE", "error": type(exc).__name__})
-            print(json.dumps(results[-1]))
-            break
+            result["error"] = load_json(raw)
+        except ValueError:
+            result["error"] = {"message": raw.decode("utf-8", "replace")[:2000]}
+        result["result"] = "FAILED"
+        if response.status == 429:
+            exc, wait = error_info(429, raw, "", zen=row["lane"] == "zen")
+            data = result["error"]
+            detail = data.get("error", data) if isinstance(data, dict) else None
+            local_code = detail.get("code") if isinstance(detail, dict) else None
+            overloaded = local_code == "ZenOverloaded" or (exc.code == "ZenOverloaded" and wait == 0)
+            result["result"] = ("UPSTREAM_OVERLOADED" if overloaded
+                                else "FREE_TIER_REFUSED_QUOTA_OR_CLIENT")
+        return result
+    if "text/event-stream" not in response.getheader("Content-Type", "").lower():
+        return dict(result, result="NO_VERIFIED_ANSWER", error={"code": "UnexpectedResponse"})
+    text, terminal, error, called_tool = [], False, None, False
+    for _, data in sse_events(response):
+        if data == b"[DONE]":
+            terminal = True
+            continue
+        if not data:
+            continue
+        event = load_json(data)
+        if event.get("error") or event.get("type") in {"error", "response.failed", "response.incomplete"}:
+            error = event
+        if event.get("type") == "response.output_text.delta":
+            text.append(event.get("delta", ""))
+        elif event.get("type") == "content_block_delta":
+            text.append(event.get("delta", {}).get("text", ""))
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            text.append(delta.get("content") or "")
+            called_tool |= bool(delta.get("tool_calls"))
+            if choice.get("finish_reason") in STREAM_FAILURES:
+                error = {"code": choice["finish_reason"]}
+        called_tool |= ((event.get("item") or {}).get("type") in {"function_call", "custom_tool_call"}
+                        or (event.get("content_block") or {}).get("type") == "tool_use")
+        terminal |= is_terminal(event, row["endpoint"])
+        if event.get("usage") and "cost" in event["usage"]:
+            result["cost"] = event["usage"]["cost"]
+    passed = terminal and not error and not called_tool and "".join(text).strip() == "BRIDGE_OK"
+    result["result"] = "MODEL_ANSWER_CONFIRMED" if passed else "NO_VERIFIED_ANSWER"
+    if error:
+        result["error"] = error
+    return result
+
+
+def record_probe(results, expected):
     save_private(STATE / "probe-results.json", encode({"checked_at": time.time(), "results": results}))
-    return 0 if results and all(r["result"] == "MODEL_ANSWER_CONFIRMED" for r in results) and len(results) == len(rows) else 1
+    return 0 if len(results) == expected and all(r["result"] == "MODEL_ANSWER_CONFIRMED" for r in results) else 1
+
+
+def report_probe_outcomes(results):
+    if not results:
+        return
+    try:
+        with local_request("/probe/results", results) as response:
+            if response.status != 200:
+                print(f"Probe history was not updated (HTTP {response.status}).", file=sys.stderr)
+    except (BridgeError, OSError, ValueError, http.client.HTTPException):
+        print("Probe history was not updated because the local bridge could not be reached.", file=sys.stderr)
+
+
+def probe_outcome(item, route, at):
+    status = item.get("http")
+    if item["result"] == "MODEL_ANSWER_CONFIRMED":
+        outcome = "completed"
+    elif status == 200:
+        outcome = "no_verified_answer"
+    elif status is not None:
+        outcome = "http_error"
+    else:
+        outcome = "transport_error"
+    return {"route": route, "model": item["model"], "source": "probe", "http": status, "outcome": outcome, "at": at}
+
+
+def probe(rows: list[dict]):
+    results, outcomes = [], []
+    for row in rows:
+        item = {"lane": row["lane"], "model": row["id"]}
+        try:
+            with local_request(f'/{row["lane"]}/v1/{row["endpoint"]}', probe_payload(row), probe=True) as response:
+                route = response.getheader("X-OMP-Zen-Route")
+                if route:
+                    item["route"] = route if route == "direct" else f'warp-{response.getheader("X-OMP-Zen-Proxy")}'
+                item.update(probe_reply(row, response))
+                if route and item["http"] == 200:
+                    outcomes.append(probe_outcome(item, route if route == "direct" else response.getheader("X-OMP-Zen-Endpoint"), time.time()))
+        except (OSError, ValueError, TypeError, AttributeError, BridgeError, http.client.HTTPException) as exc:
+            item.update(result="TRANSPORT_FAILURE", error=type(exc).__name__)
+        results.append(item)
+        print(json.dumps(item, ensure_ascii=False), flush=True)
+        if item.get("http") in {401, 402, 403, 409, 429} or item["result"] == "TRANSPORT_FAILURE":
+            break
+    report_probe_outcomes([outcome for outcome in outcomes if outcome["route"]])
+    return record_probe(results, len(rows))
+
+
+def restart_warps_with_429(results, targets):
+    deploy = Path(__file__).resolve().parent / "deploy"
+    bundled = load_json((deploy / "zen-proxies.json").read_bytes())
+    local_numbers = {proxy: str(number) for number, proxy in enumerate(configured_proxies(bundled), 1)}
+    numbers = []
+    skipped = []
+    for item in results:
+        proxy, _ = targets[item["route"]]
+        if item.get("http") != 429 or proxy is None:
+            continue
+        number = local_numbers.get(proxy)
+        if number is None:
+            skipped.append(item["route"])
+        else:
+            numbers.append(number)
+    if skipped:
+        print("HTTP 429 на маршрутах поза локальним пулом WARP — " + ", ".join(skipped), file=sys.stderr)
+    if not numbers:
+        print("Локальних WARP з HTTP 429 у цій перевірці немає.", file=sys.stderr)
+        return int(bool(skipped))
+    print("Перезапуск локальних WARP з HTTP 429 — " + ", ".join(numbers), file=sys.stderr, flush=True)
+    result = subprocess.run([str(deploy / "restart-warp.sh"), *numbers], check=False)
+    return result.returncode or int(bool(skipped))
+
+
+def probe_zen_routes(row, health, route, bun_bin=None, *, restart_429=False):
+    if "zen" in health["blocked_lanes"]:
+        raise BridgeError("Zen is blocked after an upstream auth, payment or policy denial.", 409, "UpstreamLaneStopped")
+    targets = {"direct": (None, health["zen_direct"])}
+    for proxy in health["zen_proxies"]:
+        host, _, port = proxy["endpoint"].rpartition(":")
+        # /health formats IPv6 proxy addresses without brackets.
+        authority = f"[{host}]:{port}" if ":" in host else proxy["endpoint"]
+        targets[f'warp-{proxy["id"]}'] = (parse_proxy("http://" + authority), proxy)
+    if route != "all" and route not in targets:
+        raise BridgeError(f"Zen route {route} is not configured on the running bridge.")
+    selected = targets if route == "all" else {route: targets[route]}
+    transport = BunTransport(bun_bin, STATE) if health["zen_transport"] == "bun" else contextlib.nullcontext(None)
+    results, outcomes = [], []
+    with transport as bun:
+        for name, (proxy, state) in selected.items():
+            item = {"lane": "zen", "model": row["id"], "route": name,
+                    "bridge_cooldown_until": state["cooldown_until"]}
+            body, headers, _ = prepare(probe_payload(row), row["endpoint"], {}, health["compat_opencode"],
+                                       health["opencode_version"], "zen")
+            headers.update(Authorization="Bearer public", Accept="text/event-stream")
+            try:
+                with contextlib.closing(bun.connection(proxy) if bun else upstream_connection(proxy)) as conn:
+                    conn.request("POST", inference_path("zen", row["endpoint"]), encode(body), headers)
+                    with contextlib.closing(conn.getresponse()) as response:
+                        item.update(probe_reply(row, response))
+            except (OSError, ValueError, TypeError, AttributeError, BridgeError, http.client.HTTPException) as exc:
+                item.update(result="TRANSPORT_FAILURE", error=getattr(exc, "code", type(exc).__name__))
+            results.append(item)
+            outcomes.append(probe_outcome(item, "direct" if proxy is None else state["endpoint"], time.time()))
+            print(json.dumps(item, ensure_ascii=False), flush=True)
+            if item.get("http") in {401, 402, 403}:
+                break
+    report_probe_outcomes(outcomes)
+    status = record_probe(results, len(selected))
+    if restart_429:
+        if len(results) != len(selected):
+            raise BridgeError("Перевірка завершилася до обходу всіх маршрутів. Повторіть після усунення помилки доступу.")
+        return restart_warps_with_429(results, selected)
+    return status
 
 
 def doctor_table(headers, rows, numeric=()):
@@ -1371,13 +1905,26 @@ def doctor_memory(health):
     return result
 
 
-def doctor_report(health, memory=None):
+def doctor_report(health, memory=None, model=None):
     stats = health.get("zen_stats") or {}
     routes = stats.get("routes") or {}
     entries = [("direct", "direct", health.get("zen_direct") or {})]
     entries.extend((f"WARP {proxy['id']}", proxy.get("endpoint"), proxy)
                    for proxy in health.get("zen_proxies") or [])
     lines = [f"OMP Bridge {health.get('version', '?')} — " + ("працює" if health.get("ok") else "не готовий")]
+    startup = health.get("startup") or {}
+    phase = startup.get("phase")
+    phases = {"starting": "запускається", "checking_version": "перевіряє версію OpenCode",
+              "loading_catalog": "завантажує каталог безкоштовних моделей",
+              "catalog_unavailable": "каталог недоступний, брідж повторить спробу",
+              "starting_transport": "запускає транспорт Zen", "startup_failed": "помилка запуску"}
+    if phase in phases:
+        detail = " (" + startup["error"] + ")" if startup.get("error") else ""
+        lines.append("Запуск — " + phases[phase] + detail)
+    warp = health.get("warp_readiness") or {}
+    if warp.get("configured"):
+        lines.append(f"WARP — підтверджено {warp['verified']}/{warp['configured']}, "
+                     f"ще перевіряються {warp['pending']}, недоступні {warp['unavailable']}")
     if stats.get("started_at") is not None:
         lines.append("Облік від: " + time.strftime("%d.%m.%Y %H:%M:%S %Z", time.localtime(stats["started_at"])))
     else:
@@ -1413,6 +1960,23 @@ def doctor_report(health, memory=None):
         # Retry-After/error codes come from upstream; never emit terminal controls.
         return "".join(char if char.isprintable() else "?" for char in str(value))[:120]
 
+    latest = [record for record in stats.get("latest", []) if model is None or record["model"] == model]
+    if "latest" in stats:
+        lines.extend(["", "Останні відповіді Zen за моделлю та маршрутом"])
+        if latest:
+            sources = {"request": "Робочий запит", "probe": "Проба маршруту", "omp": "Проба OMP"}
+            outcomes = {"completed": "завершено", "http_error": "відмова", "stream_error": "незавершений потік",
+                        "transport_error": "транспортна помилка", "no_verified_answer": "відповідь не підтверджено"}
+            labels = {endpoint: label for label, endpoint, _ in entries}
+            visible = latest if model else latest[:18]
+            rows = [[timestamp(r["at"]), printable(r["model"]), labels.get(r["route"], printable(r["route"])),
+                     sources[r["source"]], r["http"] or "—", outcomes[r["outcome"]]] for r in visible]
+            lines.append(doctor_table(["Час", "Модель", "Маршрут", "Запит", "HTTP", "Результат"], rows, (4,)))
+            if len(latest) > len(visible):
+                lines.append("Усі записи для моделі доступні через doctor --model <id>.")
+        else:
+            lines.append("Поки немає записів.")
+
     model_rows, ip_rows, pause_rows = [], [], []
     model_totals, ip_totals = [0] * 4, [0] * 3
     missing = False
@@ -1431,7 +1995,7 @@ def doctor_report(health, memory=None):
         if "zen" in (health.get("blocked_lanes") or []):
             status = "Канал зупинено"
         elif max(quota, transport) > 0:
-            status = ("Квота: " if quota >= transport else "Мережа: ") + duration(max(quota, transport))
+            status = ("429: " if quota >= transport else "Мережа: ") + duration(max(quota, transport))
         else:
             status = "Без паузи"
         ram = "—" if endpoint == "direct" else "н/д"
@@ -1456,7 +2020,7 @@ def doctor_report(health, memory=None):
                     and last.get("cooldown_until") == state.get("quota_cooldown_until")):
                 reason = "429 " + printable(last.get("code") or "тип н/д")
             else:
-                reason = "Квота; історія 429 н/д"
+                reason = "Відмова; історія 429 н/д"
         elif transport > 0:
             reason = "Транспортна помилка"
         else:
@@ -1490,14 +2054,50 @@ def doctor_report(health, memory=None):
     if memory.get("error"):
         lines.append("Пам'ять WARP / час роботи: " + memory["error"])
     lines.extend(["", "Лічильники накопичувальні; локальні відмови через cooldown не є спробами.",
-                  "Остання 429 — історія відповідей через цей брідж; н/д — дані не збережені, зокрема для старих пауз.",
+                  "Остання 429 — історія відповідей через цей брідж; н/д — дані не збережені.",
                   "Retry-After — отриманий заголовок (число означає секунди); немає — заголовок відсутній.",
                   "Час 429 і кінець чинної паузи містять дату, секунди й UTC-зсув; — означає відсутність чинної паузи.",
-                  "Без паузи — немає відомої відмови; доступність квоти тут не перевіряється.",
+                  "Без паузи — маршрут доступний для спроби; доступність квоти тут не перевіряється.",
+                  "429 може означати квоту або несумісний клієнт; Retry-After не гарантує відновлення генерації.",
                   "RAM — поточне споживання контейнера WARP із проксі, без спільних витрат Colima.",
                   "Час роботи — від останнього запуску контейнера; після його перезапуску відлік починається заново.",
                   "н/д — немає виміру; + у підсумку — частина вузлів без виміру; direct не має WARP-контейнера."])
     return "\n".join(lines)
+
+
+def start_bridge(server, args, listener):
+    """Initialize inference while the loopback HTTP server serves startup status."""
+    stop = server.ip_monitor_stop
+    try:
+        server.set_startup("checking_version")
+        version = opencode_version(args.opencode_version)
+        while not stop.is_set():
+            server.set_startup("loading_catalog")
+            try:
+                snapshot = server.catalog.get()
+                if not snapshot["models"]:
+                    raise BridgeError("No verified zero-cost models.", 503, "CatalogUnavailable")
+            except BridgeError as exc:
+                server.set_startup("catalog_unavailable", exc.code)
+                stop.wait(CATALOG_STARTUP_RETRY)
+            else:
+                break
+        if stop.is_set():
+            return
+        server.set_startup("starting_transport")
+        transport = BunTransport(args.bun_bin, STATE) if args.compat_opencode and args.zen_transport == "bun" else contextlib.nullcontext(None)
+        with transport as bun:
+            server.activate(version, bun)
+            print(f"OMP free-only bridge ready; {len(snapshot['models'])} verified zero-cost routes.", flush=True)
+            try:
+                listener.join()
+            finally:
+                server.set_startup("stopping")
+    except (BridgeError, OSError, ValueError) as exc:
+        error = getattr(exc, "code", type(exc).__name__)
+        server.set_startup("startup_failed", error)
+        print(f"Bridge startup failed ({error}). Run bridge.py doctor.", file=sys.stderr, flush=True)
+        listener.join()
 
 
 def main(argv=None):
@@ -1508,16 +2108,24 @@ def main(argv=None):
     serve = sub.add_parser("serve", help="Run a foreground, loopback-only proxy")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--compat-opencode", action="store_true", help="Explicitly enable unofficial PR-style OpenCode identity and tool padding; account-policy risk")
-    serve.add_argument("--opencode-version", default="1.19.0", help="OpenCode client UA version")
+    serve.add_argument("--opencode-version", default="auto", help="Zen OpenCode 2.x.y version, or auto from the official @opencode/cli release")
     serve.add_argument("--zen-proxy", action="append", metavar="http://HOST:PORT",
                        help=f"Override saved zen-proxies.json; up to {MAX_ZEN_PROXIES} fixed WARP exits, tried in order after direct quota exhaustion")
+    serve.add_argument("--zen-transport", choices=("bun", "python"), default="bun", help="Zen network runtime; Bun matches the qualified OpenCode 2 stack")
+    serve.add_argument("--bun-bin", help="Path to qualified Bun 1.3.14")
     doctor = sub.add_parser("doctor", help="Show human-readable route statistics and health; does not infer")
     doctor.add_argument("--json", action="store_true", help="Print the complete machine-readable /health JSON")
+    doctor.add_argument("--model", help="Show latest results for this exact model ID")
     smoke = sub.add_parser("probe", help="Opt-in live check: accepts only a real completed model answer as success")
     pick = smoke.add_mutually_exclusive_group(required=True)
     pick.add_argument("--model", help="Exact ID in the current free allowlist")
     pick.add_argument("--all", action="store_true", help="One sequential call per approved model; stop on policy/quota denial")
     smoke.add_argument("--lane", choices=tuple(BASES), default="zen")
+    smoke.add_argument("--route", choices=["direct", *(f"warp-{i}" for i in range(1, MAX_ZEN_PROXIES + 1)), "all"],
+                       help="Zen only: one live request per selected route, with the running bridge's local cooldown shown separately")
+    smoke.add_argument("--bun-bin", help="Qualified Bun executable for per-route probes, if installed separately")
+    smoke.add_argument("--omp", action="store_true", help="Run real OMP turns, a disposable edit and compaction over the running bridge")
+    smoke.add_argument("--restart-429", action="store_true", help="After --route all, restart local WARP containers that returned HTTP 429")
     args = parser.parse_args(argv)
     if args.command == "login":
         key = getpass.getpass("Zen/Go API key (not a Console st- token): ").strip()
@@ -1536,48 +2144,77 @@ def main(argv=None):
                 raise BridgeError("Health response exceeds 2 MiB.")
             health = load_json(raw)
             if args.json:
+                if args.model and "latest" in (health.get("zen_stats") or {}):
+                    health["zen_stats"]["latest"] = [r for r in health["zen_stats"]["latest"] if r["model"] == args.model]
                 print(json.dumps(health, ensure_ascii=False))
             elif response.status == 200:
-                print(doctor_report(health, doctor_memory(health)))
+                print(doctor_report(health, doctor_memory(health) if health.get("ok") else None, args.model))
             else:
                 detail = health.get("error") or health
                 print("Перевірка бріджа не вдалася: " + str(detail.get("message", detail)))
-            return 0 if response.status == 200 else 1
+            return 0 if response.status == 200 and health.get("ok") else 1
     if args.command == "probe":
+        if args.restart_429 and args.route != "all":
+            smoke.error("--restart-429 requires --route all")
+        if args.omp and (args.lane != "zen" or args.all or args.route):
+            smoke.error("--omp requires --lane zen and one --model, using normal bridge routing")
+        if args.route and (args.lane != "zen" or args.all):
+            smoke.error("--route requires --lane zen and one --model")
+        if args.bun_bin and not args.route:
+            smoke.error("--bun-bin requires --route")
         with local_request("/catalog") as response:
             if response.status != 200:
                 raise BridgeError("Proxy catalog unavailable.", 503)
             rows = load_json(response.read(MAX_BODY))["models"]
-        if not args.all:
-            rows = [r for r in rows if r["lane"] == args.lane and r["id"] == args.model]
+        rows = [r for r in rows if r["lane"] == args.lane and (args.all or r["id"] == args.model)]
         if not rows:
             raise BridgeError("No matching approved free models. Run catalog for exclusion reasons.")
+        if args.omp:
+            if rows[0]["endpoint"] != "chat/completions":
+                smoke.error("--omp currently verifies Zen Chat Completions models")
+            results = []
+            for outcome in probe_omp(STATE, rows[0]):
+                item = {"lane": "zen", "model": rows[0]["id"], "source": "omp", **outcome}
+                results.append(item)
+                print(json.dumps(item, ensure_ascii=False), flush=True)
+            return record_probe(results, 3)
+        if args.route:
+            with local_request("/health") as response:
+                if response.status != 200:
+                    raise BridgeError("Running bridge health unavailable.", 503)
+                health = load_json(response.read(MAX_FRAME))
+            return probe_zen_routes(rows[0], health, args.route, args.bun_bin, restart_429=args.restart_429)
         return probe(rows)
-    if not 1 <= args.port <= 65535 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.opencode_version):
+    def stop_service(_signum, _frame):
+        raise KeyboardInterrupt
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop_service)
+    if not 1 <= args.port <= 65535:
         raise BridgeError("Invalid port or OpenCode version.")
     zen_proxies = configured_proxies(args.zen_proxy)
+    if args.opencode_version != "auto" and not re.fullmatch(r"2\.[0-9]+\.[0-9]+", args.opencode_version):
+        raise BridgeError("Zen compatibility requires an OpenCode 2.x.y release.")
     key, token = key_from_user(required=False), token_from_user()
-    catalog = Catalog()
-    snapshot = catalog.get()
-    if not snapshot["models"]:
-        raise BridgeError("No verified zero-cost models. Inspect catalog; no inference allowed.", 503)
-    server = BridgeServer(("127.0.0.1", args.port), catalog, key, token, args.compat_opencode, args.opencode_version, zen_proxies=zen_proxies, state=STATE)
-    with server.lock:
-        server.save_zen_cooldowns()
-    save_private(STATE / "runtime.json", encode({"port": args.port, "version": VERSION, "pid": os.getpid()}))
-    print(f"OMP free-only bridge: 127.0.0.1:{args.port}; {len(snapshot['models'])} verified zero-cost routes.", flush=True)
-    print(f"Zen routing: direct, then {len(zen_proxies)} fixed WARP proxies in configured order; quota cooldowns are per route." if zen_proxies else "Zen routing: direct.", flush=True)
-    print("No OpenCode CLI. No stream replay. No paid fallback. Ctrl+C stops the proxy.", flush=True)
-    if args.compat_opencode:
-        print("UNOFFICIAL COMPATIBILITY ENABLED: OpenCode-shaped identity and guarded tool padding. Account-policy risk; read docs/ДОСЛІДЖЕННЯ.md.", flush=True)
-    server.start_ip_monitor()
-    try:
-        server.serve_forever(poll_interval=0.25)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.ip_monitor_stop.set()
-        server.server_close()
+    with BridgeServer(("127.0.0.1", args.port), Catalog(), key, token, args.compat_opencode,
+                      zen_proxies=zen_proxies, state=STATE, starting=True) as server:
+        with server.lock:
+            server.save_zen_cooldowns()
+        save_private(STATE / "runtime.json", encode({"port": args.port, "version": VERSION, "pid": os.getpid()}))
+        print(f"OMP free-only bridge listening at 127.0.0.1:{args.port}; loading configuration.", flush=True)
+        if args.compat_opencode:
+            print("UNOFFICIAL COMPATIBILITY ENABLED: OpenCode-shaped identity and guarded tool padding. Account-policy risk; read docs/ДОСЛІДЖЕННЯ.md.", flush=True)
+        server.start_ip_monitor()
+        listener = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25},
+                                    name="bridge-http", daemon=True)
+        listener.start()
+        try:
+            start_bridge(server, args, listener)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.ip_monitor_stop.set()
+            server.shutdown()
+            listener.join()
     return 0
 
 

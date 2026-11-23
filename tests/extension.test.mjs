@@ -180,3 +180,13 @@ test('chat editions without effort controls never emit unsupported reasoning_eff
   assert.equal(effort.compat.supportsReasoningEffort, true);
   assert.deepEqual(effort.thinking.efforts, ['low', 'high']);
 });
+
+
+test('passes the current workspace only in private bridge metadata', async () => {
+  await extension(pi);
+  const payload = { model: 'chat-free', messages: [{ role: 'user', content: 'Привіт' }] };
+  const result = handlers.get('before_provider_request')({ payload }, ctx({ cwd: '/workspace/yuki' }));
+  assert.equal(result._omp_free_directory, '/workspace/yuki');
+  assert.equal(payload._omp_free_directory, undefined);
+  assert.deepEqual(result.messages, payload.messages);
+});
